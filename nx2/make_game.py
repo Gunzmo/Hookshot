@@ -362,10 +362,7 @@ def main():
             shutil.copytree(kept, exefs)
         else:
             shutil.rmtree(game, ignore_errors=True)
-
-            shutil.rmtree(kept, ignore_errors=True)
-            if not os.path.exists(good):
-                shutil.rmtree(romfs, ignore_errors=True)
+            # Keep the previous cache until the replacement has been extracted and validated.
             files = {"of": 0}
 
             def unpacked(line):   # (nup.py: the title it unpacks says its romfs's file count, then every 5000 files a count)
@@ -421,11 +418,7 @@ def main():
 
     say("stage", "lift", "Translating the game to PC code")
     run(PY + ["nx2/lift.py", "--standalone", "--write", "--exefs", exefs, "--work", work], env)
-<<<<<<< HEAD
-    if os.path.isfile(os.path.join(work, "sa", "gen", "code_hot.c")):
-=======
-    if os.path.exists(os.path.join(work, "sa", "gen", "code_hot.c")):   # (only with hot_funcs.txt: the lift writes none without)
->>>>>>> gab9281/linux-port
+    if os.path.isfile(os.path.join(work, "sa", "gen", "code_hot.c")):   # (only with hot_funcs.txt: the lift writes none without)
         run(PY + ["nx2/split_hot.py", os.path.join(work, "sa", "gen")], env)   # (eight files side by side: ~6 minutes, not 79)
 
     say("stage", "compile", "Compiling")

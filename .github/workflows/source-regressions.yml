@@ -4,6 +4,14 @@ on:
   push:
     branches: [main]
     paths:
+      - host/hos.h
+      - host/nn_fs.c
+      - host/fs_platform.h
+      - nx2/kit.py
+      - nx2/rtgen.py
+      - third_party/a64-kit/rt/a64.h
+      - tests/test_nn_fs_linux.c
+      - tests/test_nn_fs_linux.py
       - nx2/nup.py
       - nx2/make_game.py
       - nx2/unpack.py
@@ -13,6 +21,14 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - host/hos.h
+      - host/nn_fs.c
+      - host/fs_platform.h
+      - nx2/kit.py
+      - nx2/rtgen.py
+      - third_party/a64-kit/rt/a64.h
+      - tests/test_nn_fs_linux.c
+      - tests/test_nn_fs_linux.py
       - nx2/nup.py
       - nx2/make_game.py
       - nx2/unpack.py
@@ -50,3 +66,6 @@ jobs:
         run: python -I -B nx2/test_nup_paths.py
       - name: Check source-cache coherency
         run: python -I -B tests/test_make_game_cache.py
+      - name: Check Linux guest filesystem
+        if: runner.os == 'Linux'
+        run: python -I -B tests/test_nn_fs_linux.py
