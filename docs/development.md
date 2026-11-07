@@ -78,11 +78,23 @@ build with the normal Linux runtime command. Native platform tests need no WebGP
 runtime check links the built renderer objects into a temporary device-initialization harness and uses a software
 Vulkan adapter when available:
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:250f656f882f224bde5fa930931d77eaba571e3e64678b9fe61b49fa9515fbf7 -->
+
 ```sh
 python -I -B tests/test_webgpu_linux.py
 WGPU_NATIVE=/path/to/wgpu-native python -I nx2/build.py --part runtime --target linux
 python -I -B tests/test_webgpu_linux.py --runtime work/runtime-linux
 ```
+
+With an X11 display, add `--window` to the runtime check to exercise SDL surface creation. For a virtual display:
+
+```sh
+xvfb-run -a python -I -B tests/test_webgpu_linux.py --runtime work/runtime-linux --window
+```
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 ### Dependencies and release folders
 
