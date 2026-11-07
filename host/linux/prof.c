@@ -26,12 +26,12 @@
 #include <ucontext.h>
 #include <unistd.h>
 #include <unwind.h>
-#include <windows.h>
+#include "hos_platform.h"
 #ifndef TRAP_PERF   /* (the kernel's since 5.13; glibc names it from 2.36) */
 #define TRAP_PERF 6
 #endif
 
-int hos_thread_handles(HANDLE *out, const char **names, int max);   /* hos_thread.c */
+int hos_thread_ids(uint32_t *out, const char **names, int max);   /* hos_thread.c */
 void hos_prof_start(void);
 
 /* ---- the process's threads: id, CPU time, name (the guest thread's, else the thread's own: SetThreadDescription) ---- */
@@ -67,11 +67,11 @@ static void task_comm(int tid, char *out, size_t cap) {
     fclose(f);
 }
 static int tasks(Task *out, int max) {
-    static HANDLE gh[1024];
+    static uint32_t gh[1024];
     static const char *gn[1024];
-    const int ng = hos_thread_handles(gh, gn, 1024);
+    const int ng = hos_thread_ids(gh, gn, 1024);
     static int gtid[1024];
-    for (int i = 0; i < ng; i++) gtid[i] = (int)GetThreadId(gh[i]);
+    for (int i = 0; i < ng; i++) gtid[i] = (int)gh[i];
     int n = 0;
     DIR *d = opendir("/proc/self/task");
     if (!d) return 0;
@@ -93,14 +93,14 @@ static int tasks(Task *out, int max) {
 }
 
 /* HOS_PROFILE=<seconds>: every interval, the busiest threads and their share of a core */
-static DWORD WINAPI prof_thread(void *p) {
-    const DWORD ms = (DWORD)(uintptr_t)p * 1000;
+static void prof_thread(void *p) {
+    const uint32_t ms = (uint32_t)(uintptr_t)p * 1000;
     enum { MAXT = 512 };
     static int ids[MAXT];
     static uint64_t was[MAXT];
     int nwas = 0;
     for (;;) {
-        Sleep(ms);
+        hos_sleep_ns((int64_t)(ms) * 1000000);
         static Task cur[MAXT];
         static uint64_t delta[MAXT];
         const int n = tasks(cur, MAXT);
@@ -126,17 +126,17 @@ static DWORD WINAPI prof_thread(void *p) {
         snprintf(line + len, sizeof line - len, " all %.0f", total / (ms * 10000.0));
         hos_log("%s", line);
     }
-    return 0;
+    return;
 }
 
 /* HOS_THREAD_TIMES=<seconds>: every interval, the threads that used over 5% of a core */
-static DWORD WINAPI thread_times_thread(void *p) {
-    const DWORD ms = (DWORD)(uintptr_t)p * 1000;
+static void thread_times_thread(void *p) {
+    const uint32_t ms = (uint32_t)(uintptr_t)p * 1000;
     enum { MAXT = 512 };
     static struct { int tid; uint64_t cpu; } last[MAXT];
     int nlast = 0;
     for (;;) {
-        Sleep(ms);
+        hos_sleep_ns((int64_t)(ms) * 1000000);
         static Task now[MAXT];
         const int n = tasks(now, MAXT);
         char line[4096];
@@ -245,13 +245,13 @@ static uintptr_t exe_base(void) {
 /* HOS_SAMPLE=<thread name> (with HOS_PROFILE=<seconds>): that thread sampled every millisecond; every interval its
    most frequent places, as module+offset of the leaf and of the first frame in the runtime under it. HOS_SAMPLE_FILE:
    every sample's whole stack too, a line of frames leaf first (scripts/prof.py) */
-static DWORD WINAPI sample_thread(void *p) {
+static void sample_thread(void *p) {
     const char *want = (const char *)p;
-    const DWORD ms = (DWORD)atoi(getenv("HOS_PROFILE")) * 1000;
+    const uint32_t ms = (uint32_t)atoi(getenv("HOS_PROFILE")) * 1000;
     sampling_init();
     int tid = 0;
     while (!tid) {   /* (the renderer's threads start late) */
-        Sleep(1000);
+        hos_sleep_ns((int64_t)(1000) * 1000000);
         static Task all[512];
         const int n = tasks(all, 512);
         for (int i = 0; i < n && !tid; i++)
@@ -262,13 +262,13 @@ static DWORD WINAPI sample_thread(void *p) {
     enum { SLOTS = 4096 };
     static struct { uint64_t key; uint32_t n; } leaf[SLOTS], ours[SLOTS];
     uint32_t total = 0;
-    DWORD last = GetTickCount();
+    uint32_t last = (uint32_t)(hos_now_ns() / 1000000);
     FILE *stacks = getenv("HOS_SAMPLE_FILE") ? fopen(getenv("HOS_SAMPLE_FILE"), "w") : NULL;
     for (;;) {
-        Sleep(1);
+        hos_sleep_ns((int64_t)(1) * 1000000);
         uintptr_t pcs[DEPTH];
         const int n = sample_one(tid, pcs, DEPTH);
-        if (n < 0) return 0;   /* (the thread ended) */
+        if (n < 0) return;   /* (the thread ended) */
         uint64_t keys[2] = {0, 0};
         char stack_line[1024];
         int stack_len = 0;
@@ -295,8 +295,8 @@ static DWORD WINAPI sample_thread(void *p) {
                 }
             }
         }
-        if (GetTickCount() - last >= ms) {
-            last = GetTickCount();
+        if ((uint32_t)(hos_now_ns() / 1000000) - last >= ms) {
+            last = (uint32_t)(hos_now_ns() / 1000000);
             for (int t = 0; t < 2; t++) {
                 typeof(leaf[0]) *tab = t ? ours : leaf;
                 char line[2048];
@@ -317,15 +317,15 @@ static DWORD WINAPI sample_thread(void *p) {
             if (stacks) fflush(stacks);
         }
     }
-    return 0;
+    return;
 }
 
 /* HOS_SAMPLE_ALL=<path> (with HOS_PROFILE): while <path>.go exists, every 2 ms every guest thread and the renderer's
    threads (names starting "mkw_vk") sampled one after another: a line per thread, "<ms> <name>|<frames>", 16 frames
    at most (scripts/crit.py, scripts/hotlist.py) */
-static DWORD WINAPI sample_all_thread(void *p) {
+static void sample_all_thread(void *p) {
     const char *path = (const char *)p;
-    char go[MAX_PATH];
+    char go[4096];
     snprintf(go, sizeof go, "%s.go", path);
     sampling_init();
     FILE *out = NULL;
@@ -338,12 +338,12 @@ static DWORD WINAPI sample_all_thread(void *p) {
     for (;;) {
         if (access(go, F_OK)) {
             if (out) { fclose(out); out = NULL; hos_log("prof: all-thread sampling stopped"); }
-            Sleep(200);
+            hos_sleep_ns((int64_t)(200) * 1000000);
             continue;
         }
         if (!out) {
             out = fopen(path, "a");
-            if (!out) { Sleep(1000); continue; }
+            if (!out) { hos_sleep_ns((int64_t)(1000) * 1000000); continue; }
             static Task all[512];
             const int n = tasks(all, 512);
             nt = 0;
@@ -357,7 +357,7 @@ static DWORD WINAPI sample_all_thread(void *p) {
             t0 = hos_now_ns();
             hos_log("prof: all-thread sampling of %d threads into %s", nt, path);
         }
-        Sleep(2);
+        hos_sleep_ns((int64_t)(2) * 1000000);
         const long ms = (long)((hos_now_ns() - t0) / 1000000);
         for (int i = 0; i < nt; i++) {
             uintptr_t pcs[16];
@@ -374,15 +374,15 @@ static DWORD WINAPI sample_all_thread(void *p) {
             fprintf(out, "%s\n", line);
         }
     }
-    return 0;
+    return;
 }
 
 /* HOS_WATCH=<file> (diagnostic): when <file> exists (up to 4 guest addresses in hex), data breakpoints on them on every
    guest thread: 4 s on reads and writes, then 4 s on writes; <file>.out gets, by address and the host place of the
    access, how many; then <file> is renamed <file>.done and the next one may come. */
 static uint64_t watch_keys[8192];
-static volatile LONG watch_counts[8192];
-static volatile LONG watch_phase;
+static volatile int32_t watch_counts[8192];
+static volatile int32_t watch_phase;
 static struct sigaction watch_prev;
 static void on_watch(int sig, siginfo_t *si, void *uctx) {
     if (si->si_code != TRAP_PERF) {   /* (a breakpoint of the game's or a debugger's: host/linux/win32.c's handlers) */
@@ -403,7 +403,7 @@ static void on_watch(int sig, siginfo_t *si, void *uctx) {
             if (__atomic_compare_exchange_n(&watch_keys[i], &expect, key, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) k = key;
             else k = expect;
         }
-        if (k == key) { InterlockedIncrement(&watch_counts[i]); break; }
+        if (k == key) { __atomic_add_fetch(&watch_counts[i], 1, __ATOMIC_RELAXED); break; }
     }
 }
 enum { WATCH_FDS = 1024 * 4 };
@@ -413,13 +413,13 @@ static void watch_arm(const uint64_t *addr, int n, int rw) {
     for (int i = 0; i < nwatch_fd; i++) close(watch_fd[i]);
     nwatch_fd = 0;
     if (!rw) return;
-    static HANDLE gh[1024];
+    static uint32_t gh[1024];
     static const char *gn[1024];
-    const int ng = hos_thread_handles(gh, gn, 1024);
+    const int ng = hos_thread_ids(gh, gn, 1024);
     int failed = 0, err = 0;
     for (int t = 0; t < ng; t++) {
-        const int tid = (int)GetThreadId(gh[t]);
-        if (!tid || tid == (int)GetCurrentThreadId()) continue;
+        const int tid = (int)gh[t];
+        if (!tid || tid == (int)hos_host_thread_id()) continue;
         for (int k = 0; k < n && nwatch_fd < WATCH_FDS; k++) {
             struct perf_event_attr a;
             memset(&a, 0, sizeof a);
@@ -441,7 +441,7 @@ static void watch_arm(const uint64_t *addr, int n, int rw) {
     }
     if (failed) hos_log("watch: %d breakpoints not set (perf_event_open: %s; /proc/sys/kernel/perf_event_paranoid)", failed, strerror(err));
 }
-static DWORD WINAPI watch_thread(void *p) {
+static void watch_thread(void *p) {
     const char *path = (const char *)p;
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -449,7 +449,7 @@ static DWORD WINAPI watch_thread(void *p) {
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
     sigemptyset(&sa.sa_mask);
     for (;;) {
-        Sleep(300);
+        hos_sleep_ns((int64_t)(300) * 1000000);
         FILE *f = fopen(path, "r");
         if (!f) continue;
         uint64_t addr[4];
@@ -467,11 +467,11 @@ static DWORD WINAPI watch_thread(void *p) {
             watch_phase = ph;
             for (int t = 0; t < 4; t++) {   /* (threads that started since) */
                 watch_arm(addr, n, ph ? 1 : 3);
-                Sleep(1000);
+                hos_sleep_ns((int64_t)(1000) * 1000000);
             }
         }
         watch_arm(addr, 0, 0);
-        char out[MAX_PATH], done[MAX_PATH];
+        char out[4096], done[4096];
         snprintf(out, sizeof out, "%s.out", path);
         snprintf(done, sizeof done, "%s.done", path);
         f = fopen(out, "a");
@@ -490,18 +490,18 @@ static DWORD WINAPI watch_thread(void *p) {
         rename(path, done);
         hos_log("watch: done");
     }
-    return 0;
+    return;
 }
 
 void hos_prof_start(void) {
     const char *tt = getenv("HOS_THREAD_TIMES");
-    if (tt && atoi(tt) > 0) CreateThread(NULL, 0, thread_times_thread, (void *)(uintptr_t)atoi(tt), 0, NULL);
+    if (tt && atoi(tt) > 0) hos_start_worker(thread_times_thread, (void *)(uintptr_t)atoi(tt));
     const char *e = getenv("HOS_PROFILE");
-    if (e && atoi(e) > 0) CreateThread(NULL, 0, prof_thread, (void *)(uintptr_t)atoi(e), 0, NULL);
+    if (e && atoi(e) > 0) hos_start_worker(prof_thread, (void *)(uintptr_t)atoi(e));
     const char *s = getenv("HOS_SAMPLE");
-    if (e && atoi(e) > 0 && s && *s) CreateThread(NULL, 0, sample_thread, (void *)s, 0, NULL);
+    if (e && atoi(e) > 0 && s && *s) hos_start_worker(sample_thread, (void *)s);
     const char *all = getenv("HOS_SAMPLE_ALL");
-    if (all && *all) CreateThread(NULL, 0, sample_all_thread, (void *)all, 0, NULL);
+    if (all && *all) hos_start_worker(sample_all_thread, (void *)all);
     const char *watch = getenv("HOS_WATCH");
-    if (watch && *watch) CreateThread(NULL, 0, watch_thread, (void *)watch, 0, NULL);
+    if (watch && *watch) hos_start_worker(watch_thread, (void *)watch);
 }

@@ -5,10 +5,24 @@
    there. TPIDRRO_EL0 (thread-local region): 0x200 bytes; the SDK's nn::os keeps the current ThreadType* at
    +0x1F8, so lifted SDK code that reads it inline finds the same thread the HLE knows. */
 #include "hos.h"
+#include "hos_atomic.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include "hos_sync.h"
+#include "hos_platform.h"
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+#include <pthread.h>
+#include <errno.h>
+#include <sched.h>
+#include <signal.h>
+#include <sys/syscall.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
+#if !defined(__linux__) || defined(__EMSCRIPTEN__)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION   /* (older Windows SDKs lack it: Windows 10 1803 and later take it) */
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
@@ -19,6 +33,10 @@
 #include <unistd.h>
 #endif
 
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+typedef struct { pthread_t thread; uint32_t tid; } NativeThreadHandle;
+#endif
+
 struct HosThread {
     Ctx ctx;
     uint64_t guest_tt, entry, arg, stack, stack_size, id;
@@ -27,26 +45,37 @@ struct HosThread {
     uint64_t core_mask;
     uint64_t tls_slots[HOS_TLS_SLOTS];
     char name[48];
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    NativeThreadHandle native;
+    void *handle;   /* &native, for hos_thread_pin */
+    HosMutex wait_lock;
+    HosCond wait_cv;
+    int wake_pending, finished;
+    void *signal_stack;
+#else
     HANDLE handle;
+#endif
     int started;
     /* the kernel side (hos_svc.c): this thread's Horizon handle and the event it blocks on */
     uint32_t kernel_handle;
+#if !defined(__linux__) || defined(__EMSCRIPTEN__)
     HANDLE wake;
+#endif
     /* virtual cores (HOS_VCORES): the core held + 1 (0: none), the last one, a better waiter's request, queued */
     int vc_held, vc_last, vc_queued;
     volatile int vc_kick;
     int64_t vc_since;
-    CONDITION_VARIABLE vc_cv;
+    HosCond vc_cv;
     /* (hookshot) fibers: the context running now (NULL: ctx, the thread's own), the thread's host fiber once it
        switched to a guest fiber */
     Ctx *volatile run_ctx;
-    void *host_fiber;
+    HosFiberContext *host_fiber;
 };
 
 /* The SDK's own mutexes (InternalCriticalSection) tag a lock word with the owner's handle, read from
    ThreadType+0x1B0 through TLR+0x1F8 (sdk+0x13186c). Every thread gets a unique handle there. */
 #define TT_HANDLE 0x1B0
-static volatile LONG next_handle = 0x10000;
+static volatile int32_t next_handle = 0x10000;
 uint32_t hos_thread_handle(HosThread *t) { return t->kernel_handle; }
 
 /* nnosInitialize gives the main thread the SDK's own ThreadType (it writes TLR+0x1F8): adopt it, so the HLE and the
@@ -63,10 +92,10 @@ int hos_thread_prio(HosThread *t) { return t->priority; }
 int hos_trace;
 extern HOS_GAME_DATA const uint64_t hos_thread_start_hook, hos_thread_exit_hook;   /* gen/hos_image.c */
 static _Thread_local HosThread *cur;
-static SRWLOCK threads_lock = SRWLOCK_INIT;
+static HosRwLock threads_lock = HOS_RWLOCK_INIT;
 static HosThread *threads[1024];
 static int nthreads;
-static volatile LONG64 next_id = 0x50;
+static volatile int64_t next_id = 0x50;
 
 HosThread *hos_self(void) { return cur; }
 Ctx *hos_ctx(void) { return cur ? (cur->run_ctx ? cur->run_ctx : &cur->ctx) : NULL; }
@@ -133,11 +162,11 @@ int hos_thread_priority(HosThread *t, int set, int value) {
 }
 
 #if defined(_WIN32) && !defined(__EMSCRIPTEN__)
-static SRWLOCK log_lock = SRWLOCK_INIT, log_write_lock = SRWLOCK_INIT;
-static CONDITION_VARIABLE log_cv = CONDITION_VARIABLE_INIT;
+static HosMutex log_lock = HOS_MUTEX_INIT, log_write_lock = HOS_MUTEX_INIT;
+static HosCond log_cv = HOS_COND_INIT;
 static char *log_q[2048];
 static int log_head, log_count;
-static volatile LONG log_async = -1;
+static volatile int32_t log_async = -1;
 
 static int log_take_locked(char **out) {
     int n = 0;
@@ -161,25 +190,25 @@ static DWORD WINAPI log_main(void *p) {
     (void)p;
     static char *batch[2048];
     for (;;) {
-        AcquireSRWLockExclusive(&log_lock);
-        while (!log_count) SleepConditionVariableSRW(&log_cv, &log_lock, INFINITE, 0);
+        hos_mutex_lock(&log_lock);
+        while (!log_count) hos_cond_wait(&log_cv, &log_lock, HOS_WAIT_FOREVER);
         const int n = log_take_locked(batch);
-        AcquireSRWLockExclusive(&log_write_lock);
-        ReleaseSRWLockExclusive(&log_lock);
+        hos_mutex_lock(&log_write_lock);
+        hos_mutex_unlock(&log_lock);
         log_write(batch, n);
-        ReleaseSRWLockExclusive(&log_write_lock);
+        hos_mutex_unlock(&log_write_lock);
     }
 }
 
 static void log_flush(void) {
     if (log_async <= 0) return;
     static char *batch[2048];
-    AcquireSRWLockExclusive(&log_write_lock);
-    AcquireSRWLockExclusive(&log_lock);
+    hos_mutex_lock(&log_write_lock);
+    hos_mutex_lock(&log_lock);
     const int n = log_take_locked(batch);
-    ReleaseSRWLockExclusive(&log_lock);
+    hos_mutex_unlock(&log_lock);
     log_write(batch, n);
-    ReleaseSRWLockExclusive(&log_write_lock);
+    hos_mutex_unlock(&log_write_lock);
 }
 
 static LPTOP_LEVEL_EXCEPTION_FILTER log_prev_filter;
@@ -195,16 +224,16 @@ static LONG WINAPI log_crash_filter(EXCEPTION_POINTERS *e) {
                 log_head = (log_head + 1) % 2048;
                 log_count--;
             }
-            ReleaseSRWLockExclusive(&log_lock);
+            hos_mutex_unlock(&log_lock);
         }
-        ReleaseSRWLockExclusive(&log_write_lock);
+        hos_mutex_unlock(&log_write_lock);
     }
     return log_prev_filter ? log_prev_filter(e) : EXCEPTION_CONTINUE_SEARCH;
 }
 
 static int log_queue(const char *line) {
     if (log_async < 0) {
-        AcquireSRWLockExclusive(&log_lock);
+        hos_mutex_lock(&log_lock);
         if (log_async < 0) {
             DWORD mode;
             int on = !getenv("HOS_LOG_SYNC") && GetConsoleMode(GetStdHandle(STD_ERROR_HANDLE), &mode);
@@ -212,20 +241,20 @@ static int log_queue(const char *line) {
             if (on) log_prev_filter = SetUnhandledExceptionFilter(log_crash_filter);
             log_async = on;
         }
-        ReleaseSRWLockExclusive(&log_lock);
+        hos_mutex_unlock(&log_lock);
     }
     if (!log_async) return 0;
     char *s = _strdup(line);
     if (!s) return 0;
-    AcquireSRWLockExclusive(&log_lock);
+    hos_mutex_lock(&log_lock);
     if (log_count < 2048) {
         log_q[(log_head + log_count) % 2048] = s;
         log_count++;
-        ReleaseSRWLockExclusive(&log_lock);
-        WakeConditionVariable(&log_cv);
+        hos_mutex_unlock(&log_lock);
+        hos_cond_signal(&log_cv);
         return 1;
     }
-    ReleaseSRWLockExclusive(&log_lock);
+    hos_mutex_unlock(&log_lock);
     free(s);
     log_flush();
     return 0;
@@ -264,7 +293,8 @@ void hos_fatal(Ctx *c, const char *fmt, ...) {
     void hos_backtrace(void), hos_hostcall_stats(void);
     hos_backtrace();
     hos_hostcall_stats();
-    ExitProcess(3);
+    fflush(NULL);
+    _Exit(3);
 }
 
 /* Traps from the lifted code (rt/a64_rt.c): name the thread, then stop. */
@@ -276,13 +306,19 @@ static void setup_guest(HosThread *t) {
     t->tls_block = hos_sys_alloc(0x1000, 0x1000);
     t->tlr = hos_sys_alloc(0x200, 0x200);
     G64(t->tlr + 0x1F8) = t->guest_tt;
-    t->kernel_handle = (uint32_t)InterlockedIncrement(&next_handle);
+    t->kernel_handle = (uint32_t)__atomic_add_fetch(&next_handle, 1, __ATOMIC_SEQ_CST);
     G32(t->guest_tt + TT_HANDLE) = t->kernel_handle;
     /* (hookshot) SDK 22's InternalCriticalSection::IsLockedByCurrentThread reads the owner handle from TLR+0x110
        directly (SDK 21: ThreadType+0x1B0 through TLR+0x1F8). Left 0, every free mutex looked held by the caller
        and the first heap lock aborted in pthread_mutex_lock. */
     G32(t->tlr + 0x110) = t->kernel_handle;
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    hos_mutex_init(&t->wait_lock);
+    hos_cond_init(&t->wait_cv);
+#else
     t->wake = CreateEventA(NULL, FALSE, FALSE, NULL);   /* auto-reset: one signal, one wake-up */
+#endif
+    hos_cond_init(&t->vc_cv);
     Ctx *c = &t->ctx;
     memset(c, 0, sizeof *c);
     c->tpidr_el0 = t->tls_block + 0x800;
@@ -291,33 +327,52 @@ static void setup_guest(HosThread *t) {
 }
 
 static void track(HosThread *t) {
-    AcquireSRWLockExclusive(&threads_lock);
+    hos_rwlock_write(&threads_lock);
     if (nthreads < 1024) threads[nthreads++] = t;
-    ReleaseSRWLockExclusive(&threads_lock);
+    hos_rwlock_write_unlock(&threads_lock);
 }
 
 /* Host handles of every running guest thread, for the profiler (hos_prof.c). */
-int hos_thread_handles(HANDLE *out, const char **names, int max) {
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+int hos_thread_ids(uint32_t *out, const char **names, int max) {
+    static _Thread_local char copied_names[1024][48];
     int n = 0;
-    AcquireSRWLockShared(&threads_lock);
-    for (int i = 0; i < nthreads && n < max; i++)
-        if (threads[i]->handle) { out[n] = threads[i]->handle; names[n] = threads[i]->name; n++; }
-    ReleaseSRWLockShared(&threads_lock);
+    if (max > 1024) max = 1024;
+    hos_rwlock_read(&threads_lock);
+    for (int i = 0; i < nthreads && n < max; i++) {
+        const uint32_t tid = __atomic_load_n(&threads[i]->native.tid, __ATOMIC_ACQUIRE);
+        if (tid) {
+            out[n] = tid;
+            snprintf(copied_names[n], sizeof copied_names[n], "%s", threads[i]->name);
+            names[n] = copied_names[n]; n++;
+        }
+    }
+    hos_rwlock_read_unlock(&threads_lock);
     return n;
 }
+#else
+int hos_thread_handles(HANDLE *out, const char **names, int max) {
+    int n = 0;
+    hos_rwlock_read(&threads_lock);
+    for (int i = 0; i < nthreads && n < max; i++)
+        if (threads[i]->handle) { out[n] = threads[i]->handle; names[n] = threads[i]->name; n++; }
+    hos_rwlock_read_unlock(&threads_lock);
+    return n;
+}
+
+#endif
 
 /* (mkw-recomp) Every guest thread's name and guest registers as of its last call out of lifted code, with its
    frame chain from x29: what each thread of a stalled game waits in (mkw_glue.c, HOS_STATS_AFTER). */
 void hos_thread_dump(void) {
-    AcquireSRWLockShared(&threads_lock);
+    hos_rwlock_read(&threads_lock);
     for (int i = 0; i < nthreads; i++) {
         const Ctx *c = &threads[i]->ctx;
         char bt[400];
         int n = 0;
         uint64_t fp = c->x[29];
         for (int k = 0; k < 12 && fp && !(fp & 15) && fp < HOS_GUEST_SPACE && n < (int)sizeof bt - 24; k++) {
-            MEMORY_BASIC_INFORMATION mbi;
-            if (!VirtualQuery(GP(fp), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) break;
+            if (!hos_memory_readable(GP(fp), 16)) break;
             n += snprintf(bt + n, sizeof bt - n, " %#llx", (unsigned long long)G64(fp + 8));
             const uint64_t next = G64(fp);
             if (next <= fp) break;
@@ -330,9 +385,8 @@ void hos_thread_dump(void) {
         /* registers (current at the call out), with the text a register (or the word it points to) leads to */
         for (int r = 0; r < 29; r++) {
             uint64_t v = c->x[r], s = 0;
-            MEMORY_BASIC_INFORMATION mbi;
             for (int hop = 0; hop < 2 && v > 0x100000 && v < HOS_GUEST_SPACE - 64; hop++) {
-                if (!VirtualQuery(GP(v), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) break;
+                if (!hos_memory_readable(GP(v), 64)) break;
                 const uint8_t *p = (const uint8_t *)GP(v);
                 int k = 0;
                 while (k < 48 && p[k] >= 0x20 && p[k] < 0x7f) k++;
@@ -343,47 +397,75 @@ void hos_thread_dump(void) {
                            (const char *)GP(s));
         }
     }
-    ReleaseSRWLockShared(&threads_lock);
+    hos_rwlock_read_unlock(&threads_lock);
 }
 
 /* HOS_FP_REPORT=1 (debugging): the FPCR / FPSR of the busiest game threads, with the thread stats */
 int hos_thread_fp_report(char *out, int cap) {
     int len = 0;
-    AcquireSRWLockShared(&threads_lock);
+    hos_rwlock_read(&threads_lock);
     for (int i = 0; i < nthreads && len < cap - 64; i++) {
         const char *nm = threads[i]->name;
         if (strstr(nm, "Main") || strstr(nm, "Worker") || strstr(nm, "Executor"))
             len += snprintf(out + len, cap - len, " %s fpcr %llx fpsr %llx;", nm,
                             (unsigned long long)threads[i]->ctx.fpcr, (unsigned long long)threads[i]->ctx.fpsr);
     }
-    ReleaseSRWLockShared(&threads_lock);
+    hos_rwlock_read_unlock(&threads_lock);
     return len;
 }
 
 HosThread *hos_thread_by_handle(uint32_t h) {
     HosThread *r = NULL;
-    AcquireSRWLockShared(&threads_lock);
+    hos_rwlock_read(&threads_lock);
     for (int i = 0; i < nthreads; i++)
         if (threads[i]->kernel_handle == h) { r = threads[i]; break; }
-    ReleaseSRWLockShared(&threads_lock);
+    hos_rwlock_read_unlock(&threads_lock);
     return r;
 }
 
 /* Block on the thread's wake event (the kernel layer's lock must not be held). */
 void hos_thread_wait(HosThread *t, int64_t timeout_ns, int *timed_out) {
-    DWORD ms = timeout_ns < 0 ? INFINITE : (DWORD)((timeout_ns + 999999) / 1000000);
     const int away = hos_vcore_away();
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    if (timeout_ns >= 0) {
+        end.tv_sec += timeout_ns / 1000000000;
+        end.tv_nsec += timeout_ns % 1000000000;
+        if (end.tv_nsec >= 1000000000) end.tv_sec++, end.tv_nsec -= 1000000000;
+    }
+    hos_mutex_lock(&t->wait_lock);
+    int rc = 0;
+    while (!t->wake_pending && !rc) {
+        rc = timeout_ns < 0 ? pthread_cond_wait(&t->wait_cv, &t->wait_lock)
+                           : pthread_cond_clockwait(&t->wait_cv, &t->wait_lock, CLOCK_MONOTONIC, &end);
+    }
+    *timed_out = !t->wake_pending;
+    if (t->wake_pending) t->wake_pending = 0;   /* auto-reset, including a signal before the wait */
+    hos_mutex_unlock(&t->wait_lock);
+#else
+    DWORD ms = timeout_ns < 0 ? INFINITE : (DWORD)((timeout_ns + 999999) / 1000000);
     *timed_out = WaitForSingleObject(t->wake, ms) == WAIT_TIMEOUT;
+#endif
     if (away) hos_vcore_back();
 }
-void hos_thread_wake(HosThread *t) { SetEvent(t->wake); }
+void hos_thread_wake(HosThread *t) {
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    hos_mutex_lock(&t->wait_lock);
+    t->wake_pending = 1;
+    hos_cond_broadcast(&t->wait_cv);
+    hos_mutex_unlock(&t->wait_lock);
+#else
+    SetEvent(t->wake);
+#endif
+}
 
 HosThread *hos_thread_of(uint64_t guest_tt) {
     HosThread *r = NULL;
-    AcquireSRWLockShared(&threads_lock);
+    hos_rwlock_read(&threads_lock);
     for (int i = 0; i < nthreads; i++)
         if (threads[i]->guest_tt == guest_tt) { r = threads[i]; break; }
-    ReleaseSRWLockShared(&threads_lock);
+    hos_rwlock_read_unlock(&threads_lock);
     return r;
 }
 
@@ -392,14 +474,21 @@ Ctx *hos_boot_main_thread(uint64_t stack_size) {
     t->guest_tt = hos_sys_alloc(0x400, 0x10);      /* a ThreadType for the main thread; the SDK never made one */
     t->stack_size = stack_size;
     t->stack = hos_sys_alloc(stack_size, 0x1000);
-    t->id = InterlockedIncrement64(&next_id);
+    t->id = __atomic_add_fetch(&next_id, 1, __ATOMIC_SEQ_CST);
     t->priority = 44;                              /* main thread priority in TOTK's NPDM range */
     t->ideal_core = 0;
     t->started = 1;
     snprintf(t->name, sizeof t->name, "MainThread");
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    t->native.thread = pthread_self();
+    t->handle = &t->native;
+    t->native.tid = hos_host_thread_id();
+    pthread_setname_np(t->native.thread, "MainThread");
+#else
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &t->handle, 0, FALSE,
                     DUPLICATE_SAME_ACCESS);   /* a real handle, for the profiler */
     SetThreadDescription(GetCurrentThread(), L"MainThread");   /* (HOS_SAMPLE finds threads by it) */
+#endif
     hos_thread_pin(t->handle, t->name);
     setup_guest(t);
     t->ctx.x[31] = (t->stack + stack_size) & ~15ULL;
@@ -409,7 +498,7 @@ Ctx *hos_boot_main_thread(uint64_t stack_size) {
     return &t->ctx;
 }
 
-static DWORD WINAPI thread_main(void *p) {
+static void thread_run(void *p) {
     HosThread *t = (HosThread *)p;
     cur = t;
     Ctx *c = &t->ctx;
@@ -444,8 +533,42 @@ static DWORD WINAPI thread_main(void *p) {
     }
     if (hos_trace) hos_log("thread exit");
     hos_vcore_away();
-    return 0;
 }
+
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+static void thread_finished(void *p) {
+    HosThread *t = (HosThread *)p;
+    /* Also runs for svcExitThread's pthread_exit. Release the core before announcing completion. */
+    hos_vcore_away();
+    if (t->signal_stack) {
+        stack_t off = {.ss_flags = SS_DISABLE};
+        sigaltstack(&off, NULL);
+        free(t->signal_stack);
+    }
+    hos_mutex_lock(&t->wait_lock);
+    __atomic_store_n(&t->native.tid, 0, __ATOMIC_RELEASE);
+    t->finished = 1;
+    hos_cond_broadcast(&t->wait_cv);
+    hos_mutex_unlock(&t->wait_lock);
+}
+static void *thread_main(void *p) {
+    HosThread *t = (HosThread *)p;
+    while (!__atomic_load_n(&t->handle, __ATOMIC_ACQUIRE)) hos_yield();
+    __atomic_store_n(&t->native.tid, hos_host_thread_id(), __ATOMIC_RELEASE);
+    hos_thread_pin(&t->native, t->name);
+    t->signal_stack = malloc(64 << 10);
+    if (t->signal_stack) {
+        stack_t ss = {.ss_sp = t->signal_stack, .ss_size = 64 << 10};
+        if (sigaltstack(&ss, NULL)) { free(t->signal_stack); t->signal_stack = NULL; }
+    }
+    pthread_cleanup_push(thread_finished, t);
+    thread_run(p);
+    pthread_cleanup_pop(1);
+    return NULL;
+}
+#else
+static DWORD WINAPI thread_main(void *p) { thread_run(p); return 0; }
+#endif
 
 HosThread *hos_thread_create(uint64_t guest_tt, uint64_t entry, uint64_t arg, uint64_t stack, uint64_t stack_size,
                              int priority, int core) {
@@ -457,7 +580,7 @@ HosThread *hos_thread_create(uint64_t guest_tt, uint64_t entry, uint64_t arg, ui
     t->stack_size = stack_size;
     t->priority = priority;
     t->ideal_core = core;
-    t->id = InterlockedIncrement64(&next_id);
+    t->id = __atomic_add_fetch(&next_id, 1, __ATOMIC_SEQ_CST);
     snprintf(t->name, sizeof t->name, "Thread_%llx", (unsigned long long)entry);
     setup_guest(t);   /* FPCR starts at 0, as the kernel does it; TOTK sets FZ itself (nnMain+0x474, thread entries) */
     track(t);
@@ -468,6 +591,18 @@ void hos_thread_start(HosThread *t) {
     if (t->started) return;
     t->started = 1;
     /* Host stack: lifted code nests a C call per guest call, so give it plenty. */
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    const int stack_error = pthread_attr_setstacksize(&attr, 64 << 20);
+    const int rc = stack_error ? stack_error : pthread_create(&t->native.thread, &attr, thread_main, t);
+    pthread_attr_destroy(&attr);
+    if (rc) hos_fatal(NULL, "pthread_create failed for %s: %s", t->name, strerror(rc));
+    __atomic_store_n(&t->handle, &t->native, __ATOMIC_RELEASE);
+    char name[16];
+    snprintf(name, sizeof name, "%.15s", t->name);
+    pthread_setname_np(t->native.thread, name);
+#else
     t->handle = CreateThread(NULL, 64 << 20, thread_main, t, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (!t->handle) hos_fatal(NULL, "CreateThread failed for %s", t->name);
     if (t->name[0]) {   /* (named before it started: the OS name too, for profilers and HOS_SAMPLE) */
@@ -475,6 +610,7 @@ void hos_thread_start(HosThread *t) {
         MultiByteToWideChar(CP_UTF8, 0, t->name, -1, w, 48);
         SetThreadDescription(t->handle, w);
     }
+#endif
     hos_thread_pin(t->handle, t->name);
     pin_by_core(t);
 #ifdef __EMSCRIPTEN__
@@ -485,25 +621,58 @@ void hos_thread_start(HosThread *t) {
 void hos_thread_join(HosThread *t) {
     if (!t->handle) return;
     const int away = hos_vcore_away();
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    hos_mutex_lock(&t->wait_lock);
+    while (!t->finished) hos_cond_wait(&t->wait_cv, &t->wait_lock, HOS_WAIT_FOREVER);
+    hos_mutex_unlock(&t->wait_lock);
+#else
     WaitForSingleObject(t->handle, INFINITE);
+#endif
     if (away) hos_vcore_back();
 }
 
+void hos_thread_exit(void) {
+    hos_vcore_away();
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    pthread_exit(NULL);
+#else
+    ExitThread(0);
+#endif
+    abort();
+}
+
 void hos_thread_destroy(HosThread *t) {
-    AcquireSRWLockExclusive(&threads_lock);
+    hos_rwlock_write(&threads_lock);
     for (int i = 0; i < nthreads; i++)
         if (threads[i] == t) { threads[i] = threads[--nthreads]; break; }
-    ReleaseSRWLockExclusive(&threads_lock);
+    hos_rwlock_write_unlock(&threads_lock);
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    /* Keep the pthread descriptor alive through naming and repeatable WaitThread
+       calls, then reap it once at DestroyThread. */
+    if (t->handle && !pthread_equal(t->native.thread, pthread_self())) pthread_join(t->native.thread, NULL);
+    pthread_mutex_destroy(&t->wait_lock);
+    pthread_cond_destroy(&t->wait_cv);
+    pthread_cond_destroy(&t->vc_cv);
+#else
     if (t->handle) CloseHandle(t->handle);
+    if (t->wake) CloseHandle(t->wake);
+#endif
+    hos_fiber_destroy(t->host_fiber);
     free(t);
 }
 
 void hos_thread_set_name(HosThread *t, const char *name) {
     snprintf(t->name, sizeof t->name, "%s", name);
     if (t->handle) {
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+        char short_name[16];
+        snprintf(short_name, sizeof short_name, "%.15s", t->name);
+        pthread_setname_np(t->native.thread, short_name);
+#else
         wchar_t w[48];
         MultiByteToWideChar(CP_UTF8, 0, t->name, -1, w, 48);
         SetThreadDescription(t->handle, w);
+#endif
         hos_thread_pin(t->handle, t->name);
     }
 }
@@ -536,6 +705,79 @@ static const NameSpec *match_name_spec(const NameSpec *s, int n, const char *nam
    vk_replay.cpp pins it there): the game's threads run on the others. The replay is on the frame's critical path
    (MKW waits for the last frame's GPU work before it submits the next), and on a core shared with game threads
    it ran ~1.7x slower than alone. Only on machines with 8+ logical processors; HOS_RESERVE_CORE=0: none. */
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+static uint64_t native_reserved;
+static void find_reserved_cpus(void) {
+    if (getenv("HOS_RESERVE_CORE") && !atoi(getenv("HOS_RESERVE_CORE"))) return;
+    uint64_t seen = 0, last = 0;
+    for (unsigned cpu = 0; cpu < 64; cpu++) {
+        char path[96], line[256];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%u/topology/thread_siblings_list", cpu);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        const int got = fgets(line, sizeof line, f) != NULL;
+        fclose(f);
+        if (!got) continue;
+        uint64_t mask = 0;
+        for (char *p = line; *p && *p != '\n';) {
+            char *end;
+            long low = strtol(p, &end, 10), high = low;
+            if (end == p) break;
+            if (*end == '-') high = strtol(end + 1, &end, 10);
+            for (long i = low; i >= 0 && i <= high && i < 64; i++) mask |= 1ull << i;
+            if (*end != ',') break;
+            p = end + 1;
+        }
+        if (!mask || (mask & seen)) continue;
+        seen |= mask;
+        if (mask > last) last = mask;
+    }
+    if (__builtin_popcountll(seen) >= 8) native_reserved = last;
+}
+uint64_t hos_reserved_cpus(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, find_reserved_cpus);
+    return native_reserved;
+}
+static void native_pin(pthread_t thread, uint64_t mask) {
+    if (!mask) return;
+    cpu_set_t cpus;
+    CPU_ZERO(&cpus);
+    for (unsigned i = 0; i < 64; i++) if (mask & (1ull << i)) CPU_SET(i, &cpus);
+    pthread_setaffinity_np(thread, sizeof cpus, &cpus);
+}
+void hos_thread_pin(void *h, const char *name) {
+    if (!h) return;
+    NativeThreadHandle *thread = (NativeThreadHandle *)h;
+    const uint64_t reserved = hos_reserved_cpus();
+    if (reserved) {
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        uint64_t mask = 0;
+        if (!sched_getaffinity(0, sizeof allowed, &allowed))
+            for (unsigned i = 0; i < 64; i++) if (CPU_ISSET(i, &allowed)) mask |= 1ull << i;
+        native_pin(thread->thread, mask & ~reserved);
+    }
+    static NameSpec pins[24], prios[24];
+    static int npins = -1, nprios;
+    static HosMutex lock = HOS_MUTEX_INIT;
+    hos_mutex_lock(&lock);
+    if (npins < 0) {
+        npins = parse_name_specs(getenv("HOS_PIN"), pins, 24, 16);
+        nprios = parse_name_specs(getenv("HOS_PRIO"), prios, 24, 10);
+    }
+    hos_mutex_unlock(&lock);
+    const NameSpec *p = match_name_spec(pins, npins, name);
+    if (p && p->value) native_pin(thread->thread, (uint64_t)p->value);
+    const uint32_t tid = __atomic_load_n(&thread->tid, __ATOMIC_ACQUIRE);
+    p = match_name_spec(prios, nprios, name);
+    if (tid && p && p->value >= -2 && p->value <= 2) {
+        const int nice = (int)(-2 * p->value);
+        if (setpriority(PRIO_PROCESS, (id_t)tid, nice) && nice < 0) setpriority(PRIO_PROCESS, (id_t)tid, 0);
+    }
+}
+
+#else
 uint64_t hos_reserved_cpus(void) {
     static uint64_t mask = ~0ull;
     if (mask != ~0ull) return mask;
@@ -564,13 +806,13 @@ void hos_thread_pin(void *h, const char *name) {
     }
     static NameSpec pins[24], prios[24];
     static int npins = -1, nprios;
-    static SRWLOCK lk = SRWLOCK_INIT;
-    AcquireSRWLockExclusive(&lk);
+    static HosMutex lk = HOS_MUTEX_INIT;
+    hos_mutex_lock(&lk);
     if (npins < 0) {
         npins = parse_name_specs(getenv("HOS_PIN"), pins, 24, 16);
         nprios = parse_name_specs(getenv("HOS_PRIO"), prios, 24, 10);
     }
-    ReleaseSRWLockExclusive(&lk);
+    hos_mutex_unlock(&lk);
     const NameSpec *p = match_name_spec(pins, npins, name);
     if (p && p->value) SetThreadAffinityMask(h, (DWORD_PTR)p->value);
     static const int levels[5] = {THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL,
@@ -579,10 +821,17 @@ void hos_thread_pin(void *h, const char *name) {
         SetThreadPriority(h, levels[p->value + 2]);
 }
 
+#endif
+
 /* ---- time ------------------------------------------------------------------------------------------------ */
 uint64_t hos_ticks(void) { return recomp_cntpct(NULL); }
 
 int64_t hos_now_ns(void) {
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+#else
     static LARGE_INTEGER freq;
     static int64_t ns_per_tick;
     LARGE_INTEGER now;
@@ -595,6 +844,7 @@ int64_t hos_now_ns(void) {
     QueryPerformanceCounter(&now);
     if (ns_per_tick) return (int64_t)now.QuadPart * ns_per_tick;
     return (int64_t)((now.QuadPart / freq.QuadPart) * 1000000000LL + (now.QuadPart % freq.QuadPart) * 1000000000LL / freq.QuadPart);
+#endif
 }
 
 static void sleep_ns(int64_t ns);
@@ -602,7 +852,11 @@ static void sleep_ns(int64_t ns);
 void hos_sleep_ns(int64_t ns) {
     if (ns <= 0) {
         hos_vcore_yield();
-        SwitchToThread();
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+        sched_yield();
+#else
+        hos_yield();
+#endif
         return;
     }
     const int away = hos_vcore_away();
@@ -610,6 +864,17 @@ void hos_sleep_ns(int64_t ns) {
     if (away) hos_vcore_back();
 }
 static void sleep_ns(int64_t ns) {
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    const int64_t until = hos_now_ns() + ns;
+    /* Preserve the short-wait policy; native timers otherwise sleep to one absolute
+       monotonic deadline, including when interrupted by profiling signals. */
+    if (ns < 1000000 && !getenv("HOS_SHORT_SLEEP_TIMER")) {
+        while (hos_now_ns() < until) sched_yield();
+        return;
+    }
+    const struct timespec end = {until / 1000000000, until % 1000000000};
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &end, NULL) == EINTR) {}
+#else
     /* A high-resolution waitable timer (one per thread) sleeps to within ~0.5 ms without spinning; Sleep() rounds to
        the timer resolution, so without one the last millisecond is spun (threads that sleep in short steps, the
        vibration thread for one, used 15% of a core spinning). */
@@ -642,7 +907,7 @@ static void sleep_ns(int64_t ns) {
     if (short_timer < 0) short_timer = getenv("HOS_SHORT_SLEEP_TIMER") != NULL;
     if (ns < 1000000 && !short_timer) {
         while (hos_now_ns() < until)
-            if (!SwitchToThread()) YieldProcessor();
+            if (!hos_yield()) YieldProcessor();
         return;
     }
     if (!tried) {
@@ -658,7 +923,8 @@ static void sleep_ns(int64_t ns) {
         }
     }
     if (ns > 2000000) Sleep((DWORD)((ns - 1000000) / 1000000));
-    while (hos_now_ns() < until) SwitchToThread();
+    while (hos_now_ns() < until) hos_yield();
+#endif
 }
 
 /* ---- nn::os threads -------------------------------------------------------------------------------------- */
@@ -730,7 +996,7 @@ HLE(_ZN2nn2os19GetCurrentStackInfoEPmS1_) {
 
 HLE(_ZN2nn2os11YieldThreadEv) {
     hos_vcore_yield();
-    SwitchToThread();
+    hos_yield();
 }
 /* HOS_SLEEP_LOG=1 (diagnostic): guest sleeps by caller (LR) every 5 s: count, asked, slept */
 void hos_sleep_logged(int64_t ns, uint64_t lr) {
@@ -750,10 +1016,10 @@ void hos_sleep_logged(int64_t ns, uint64_t lr) {
     const int64_t t0 = hos_now_ns();
     hos_sleep_ns(ns);
     const int64_t took = hos_now_ns() - t0;
-    static SRWLOCK lk = SRWLOCK_INIT;
+    static HosMutex lk = HOS_MUTEX_INIT;
     static struct { uint64_t lr; int64_t n, asked, slept; } tab[64];
     static int64_t last;
-    AcquireSRWLockExclusive(&lk);
+    hos_mutex_lock(&lk);
     int i = 0;
     while (i < 64 && tab[i].lr && tab[i].lr != lr) i++;
     if (i < 64) {
@@ -772,7 +1038,7 @@ void hos_sleep_logged(int64_t ns, uint64_t lr) {
                         tab[k].slept / 1e3 / tab[k].n);
         memset(tab, 0, sizeof tab);
     }
-    ReleaseSRWLockExclusive(&lk);
+    hos_mutex_unlock(&lk);
 }
 
 /* (hookshot) OoT's present waits for its frame's GPU work by polling an NVN event, sleeping ~1.6 ms between looks
@@ -802,7 +1068,7 @@ static int present_poll(Ctx *c, int64_t ns) {
     const int away = hos_vcore_away();
     const int64_t end = hos_now_ns() + ns;
     while (v != 1 && hos_now_ns() < end) {
-        SwitchToThread();
+        hos_yield();
         for (int i = 0; i < 64; i++) _mm_pause();
         hos_nvn_event_value(ev, &v);
     }
@@ -825,12 +1091,12 @@ HLE(_ZN2nn2os11SleepThreadENS_8TimeSpanE) {
 }
 
 /* ---- TLS slots --------------------------------------------------------------------------------------------- */
-static volatile LONG slot_used[HOS_TLS_SLOTS];
+static volatile int32_t slot_used[HOS_TLS_SLOTS];
 
 /* nn::os::AllocateTlsSlot(TlsSlot*, void (*)(unsigned long)) -> Result */
 HLE(_ZN2nn2os15AllocateTlsSlotEPNS0_7TlsSlotEPFvmE) {
     for (int i = 0; i < HOS_TLS_SLOTS; i++) {
-        if (!InterlockedCompareExchange(&slot_used[i], 1, 0)) {
+        if (!HOS_ATOMIC_CAS(&slot_used[i], 1, 0)) {
             G32(ARG(0)) = (uint32_t)i;
             RET(0);
             return;
@@ -847,9 +1113,8 @@ HLE(_ZN2nn2os11SetTlsValueENS0_7TlsSlotEm) { if ((uint32_t)ARG(0) < HOS_TLS_SLOT
 volatile uint64_t hos_gfx_module;
 /* HOS_TICK_LOG=1 (diagnostic): who reads the clock, by caller (LR), every 5 s */
 static void tick_log(uint64_t lr) {
-    static CRITICAL_SECTION cs; static volatile LONG once; static uint64_t lrs[512]; static uint32_t counts[512]; static int64_t next;
-    if (!InterlockedExchange(&once, 1)) InitializeCriticalSection(&cs);
-    EnterCriticalSection(&cs);
+    static HosRecursiveMutex cs = HOS_RECURSIVE_MUTEX_INIT; static uint64_t lrs[512]; static uint32_t counts[512]; static int64_t next;
+    hos_recursive_lock(&cs);
     for (int i = (int)((lr >> 2) * 2654435761u >> 8) & 511, n = 0; n < 512; n++, i = (i + 1) & 511)
         if (!lrs[i] || lrs[i] == lr) { lrs[i] = lr; counts[i]++; break; }
     const int64_t now = hos_now_ns();
@@ -866,7 +1131,7 @@ static void tick_log(uint64_t lr) {
         memset(counts, 0, sizeof counts);
         hos_log("tick readers in 5 s:%s", line);
     }
-    LeaveCriticalSection(&cs);
+    hos_recursive_unlock(&cs);
 }
 HLE(_ZN2nn2os13GetSystemTickEv) {
     static int on = -1;
@@ -899,37 +1164,37 @@ HLE(_ZN2nn2os17ConvertToTimeSpanENS0_4TickE) {
 }
 
 /* ---- fibers (hookshot: nn::async's FiberTaskCoordinator, on OoT's nn.npln threads) ----------------------------
-   A guest fiber is a Win32 fiber with its own guest context: the lifted frames on its host stack keep using that
+   A guest fiber has its own native stack with its own guest context: the lifted frames on its host stack keep using that
    context wherever it runs, so a fiber may resume on another thread. Switching in, it takes the running thread's
    identity (TLS registers, host thread object); the thread's own context stays in HosThread.ctx. The fiber function
    returns the FiberType to switch to next (nn::os semantics). */
 typedef struct HosFiber {
     Ctx ctx;   /* (first: a context's fiber is found from its address) */
     uint64_t ft, fn, arg, stack, size;
-    void *host;
+    HosFiberContext *host;
     int started, done;
     struct HosFiber *next;
 } HosFiber;
-static SRWLOCK fibers_lock = SRWLOCK_INIT;
+static HosRwLock fibers_lock = HOS_RWLOCK_INIT;
 static HosFiber *fibers;
 
 static HosFiber *fiber_of_ft(uint64_t ft) {
-    AcquireSRWLockShared(&fibers_lock);
+    hos_rwlock_read(&fibers_lock);
     HosFiber *f = fibers;
     while (f && f->ft != ft) f = f->next;
-    ReleaseSRWLockShared(&fibers_lock);
+    hos_rwlock_read_unlock(&fibers_lock);
     return f;
 }
 static HosFiber *fiber_of_ctx(Ctx *c) {
-    AcquireSRWLockShared(&fibers_lock);
+    hos_rwlock_read(&fibers_lock);
     HosFiber *f = fibers;
     while (f && &f->ctx != c) f = f->next;
-    ReleaseSRWLockShared(&fibers_lock);
+    hos_rwlock_read_unlock(&fibers_lock);
     return f;
 }
 static void fiber_switch(Ctx *from, HosFiber *to);
 
-static void WINAPI fiber_main(void *p) {
+static void fiber_main(void *p) {
     HosFiber *f = (HosFiber *)p;
     Ctx *c = &f->ctx;
     c->x[0] = f->arg;
@@ -949,8 +1214,8 @@ static void WINAPI fiber_main(void *p) {
 static void fiber_switch(Ctx *from, HosFiber *to) {
     HosThread *t = cur;
     if (!t->host_fiber) {
-        t->host_fiber = ConvertThreadToFiberEx(NULL, FIBER_FLAG_FLOAT_SWITCH);
-        if (!t->host_fiber) hos_fatal(from, "ConvertThreadToFiber failed (%lu)", GetLastError());
+        t->host_fiber = hos_fiber_thread();
+        if (!t->host_fiber) hos_fatal(from, "could not allocate thread fiber context");
     }
     Ctx *dst = to ? &to->ctx : &t->ctx;
     if (dst == from) return;
@@ -968,7 +1233,8 @@ static void fiber_switch(Ctx *from, HosFiber *to) {
     dst->thread = t->ctx.thread;
     if (from->poll) dst->poll = 1;   /* (a pending virtual-core request follows the thread) */
     t->run_ctx = to ? &to->ctx : NULL;
-    SwitchToFiber(to ? to->host : t->host_fiber);
+    HosFiber *source = from == &t->ctx ? NULL : fiber_of_ctx(from);
+    hos_fiber_switch(source ? source->host : t->host_fiber, to ? to->host : t->host_fiber);
     /* back in `from`, maybe on another thread: take that one's identity (fiber_switch's caller set it already) */
 }
 
@@ -978,19 +1244,19 @@ HLE(_ZN2nn2os15InitializeFiberEPNS0_9FiberTypeEPFS2_PvES3_S3_mi) {
     if (!f) {
         f = (HosFiber *)calloc(1, sizeof *f);
         f->ft = ARG(0);
-        AcquireSRWLockExclusive(&fibers_lock);
+        hos_rwlock_write(&fibers_lock);
         f->next = fibers, fibers = f;
-        ReleaseSRWLockExclusive(&fibers_lock);
+        hos_rwlock_write_unlock(&fibers_lock);
     } else if (f->host) {
-        DeleteFiber(f->host);
+        hos_fiber_destroy(f->host);
     }
     memset(&f->ctx, 0, sizeof f->ctx);
     f->fn = ARG(1), f->arg = ARG(2), f->stack = ARG(3), f->size = ARG(4);
     f->started = f->done = 0;
-    f->host = CreateFiberEx(64 << 10, 64 << 20, FIBER_FLAG_FLOAT_SWITCH, fiber_main, f);
-    if (!f->host) hos_fatal(c, "CreateFiberEx failed (%lu)", GetLastError());
-    static volatile LONG logged;
-    if (InterlockedIncrement(&logged) <= 8 || hos_trace)
+    f->host = hos_fiber_create(64 << 20, fiber_main, f);
+    if (!f->host) hos_fatal(c, "could not allocate fiber stack");
+    static volatile int32_t logged;
+    if (__atomic_add_fetch(&logged, 1, __ATOMIC_SEQ_CST) <= 8 || hos_trace)
         hos_log("fiber %#llx: function %#llx arg %#llx stack %#llx+%#llx flags %d", (unsigned long long)f->ft,
                 (unsigned long long)f->fn, (unsigned long long)f->arg, (unsigned long long)f->stack,
                 (unsigned long long)f->size, (int)ARG(5));
@@ -998,7 +1264,7 @@ HLE(_ZN2nn2os15InitializeFiberEPNS0_9FiberTypeEPFS2_PvES3_S3_mi) {
 
 HLE(_ZN2nn2os13FinalizeFiberEPNS0_9FiberTypeE) {
     HosFiber *f = fiber_of_ft(ARG(0));
-    if (f && f->host && &f->ctx != c) { DeleteFiber(f->host); f->host = NULL; f->done = 1; }
+    if (f && f->host && &f->ctx != c) { hos_fiber_destroy(f->host); f->host = NULL; f->done = 1; }
 }
 
 HLE(_ZN2nn2os15GetCurrentFiberEv) {
@@ -1016,7 +1282,7 @@ HLE(_ZN2nn2os13SwitchToFiberEPNS0_9FiberTypeE) {
 
 /* Every thread's kernel handle (the tag its SDK mutexes hold), for hos_kernel_dump. */
 void hos_thread_log_handles(void) {
-    AcquireSRWLockShared(&threads_lock);
+    hos_rwlock_read(&threads_lock);
     /* (lr: the return address of the thread's last call, x0 its first argument: in a wait, which game code waits on
        what; the web has no stack walk) */
     for (int i = 0; i < nthreads; i++)
@@ -1025,7 +1291,7 @@ void hos_thread_log_handles(void) {
                 (unsigned long long)threads[i]->ctx.x[0], (unsigned long long)threads[i]->ctx.x[19],
                 (unsigned long long)threads[i]->ctx.x[20], (unsigned long long)threads[i]->ctx.x[21],
                 (unsigned long long)threads[i]->ctx.x[22]);
-    ReleaseSRWLockShared(&threads_lock);
+    hos_rwlock_read_unlock(&threads_lock);
 }
 
 /* ---- virtual cores (on unless HOS_VCORES=0) -------------------------------------------------------------------
@@ -1041,7 +1307,7 @@ void hos_thread_log_handles(void) {
    HOS_VCORE_ESCAPE_EQ_US otherwise (20000). Every 5 s the log has a "vcores:" line. GetCurrentCoreNumber answers the
    core a thread holds. */
 #if !defined(__EMSCRIPTEN__)
-static SRWLOCK vc_lock = SRWLOCK_INIT;
+static HosMutex vc_lock = HOS_MUTEX_INIT;
 static HosThread *vc_owner[8];
 static HosThread *vc_queue[1024];
 static int vc_nq;
@@ -1098,7 +1364,7 @@ static void vc_grant(int c) {
     if (!best) return;
     vc_dequeue(best);
     vc_take(best, c);
-    WakeConditionVariable(&best->vc_cv);
+    hos_cond_signal(&best->vc_cv);
 }
 static void vc_stats_locked(int64_t now) {
     if (!vc_st.since) vc_st.since = now;
@@ -1121,12 +1387,12 @@ static void vc_acquire(HosThread *t) {
         esc_better = vc_env_ns("HOS_VCORE_ESCAPE_US", 250000);
         slice = vc_env_ns("HOS_VCORE_SLICE_US", 2000);
     }
-    AcquireSRWLockExclusive(&vc_lock);
+    hos_mutex_lock(&vc_lock);
     vc_st.takes++;
     int c = vc_free_for(t);
     if (c >= 0) {
         vc_take(t, c);
-        ReleaseSRWLockExclusive(&vc_lock);
+        hos_mutex_unlock(&vc_lock);
         return;
     }
     const int64_t t0 = hos_now_ns();
@@ -1154,7 +1420,7 @@ static void vc_acquire(HosThread *t) {
             __atomic_store_n(rc ? &rc->poll : &worst->ctx.poll, 1, __ATOMIC_RELAXED);
             vc_st.kicks++;
         }
-        SleepConditionVariableSRW(&t->vc_cv, &vc_lock, 1, 0);
+        hos_cond_wait(&t->vc_cv, &vc_lock, 1);
         if (t->vc_held) break;   /* granted by a release */
         if ((c = vc_free_for(t)) >= 0) {
             vc_dequeue(t);
@@ -1184,22 +1450,22 @@ static void vc_acquire(HosThread *t) {
     vc_st.wait_ns += waited;
     if (waited > vc_st.max_ns) vc_st.max_ns = waited;
     vc_stats_locked(hos_now_ns());
-    ReleaseSRWLockExclusive(&vc_lock);
+    hos_mutex_unlock(&vc_lock);
 }
 static void vc_release(HosThread *t) {
     if (!t->vc_held) return;
-    AcquireSRWLockExclusive(&vc_lock);
+    hos_mutex_lock(&vc_lock);
     const int c = t->vc_held - 1;
     vc_owner[c] = NULL;
     t->vc_held = 0;
     t->vc_kick = 0;
     vc_grant(c);
-    ReleaseSRWLockExclusive(&vc_lock);
+    hos_mutex_unlock(&vc_lock);
 }
 /* gives the core to a waiter allowed on it that is better than t (strict) or as good (a yield) */
 static void vc_yield(HosThread *t, int strict) {
     if (!t->vc_held) return;
-    AcquireSRWLockExclusive(&vc_lock);
+    hos_mutex_lock(&vc_lock);
     const int c = t->vc_held - 1;
     int any = 0;
     for (int i = 0; i < vc_nq && !any; i++) {
@@ -1208,7 +1474,7 @@ static void vc_yield(HosThread *t, int strict) {
     }
     t->vc_kick = 0;
     if (any) vc_st.yields++;
-    ReleaseSRWLockExclusive(&vc_lock);
+    hos_mutex_unlock(&vc_lock);
     if (!any) return;
     vc_release(t);
     vc_acquire(t);
@@ -1236,11 +1502,11 @@ void hos_vcore_yield(void) {
    so callers see a spurious wake-up and look at their condition again, as they do anyway */
 int hos_cv_sleep(void *cv, void *lk, unsigned ms) {
     const int away = hos_vcore_away();
-    const BOOL r = SleepConditionVariableSRW((PCONDITION_VARIABLE)cv, (PSRWLOCK)lk, ms, 0);
+    const int r = hos_cond_wait((HosCond *)cv, (HosMutex *)lk, ms);
     if (away) {
-        ReleaseSRWLockExclusive((PSRWLOCK)lk);
+        hos_mutex_unlock((HosMutex *)lk);
         hos_vcore_back();
-        AcquireSRWLockExclusive((PSRWLOCK)lk);
+        hos_mutex_lock((HosMutex *)lk);
     }
     return r;
 }
@@ -1251,6 +1517,6 @@ void hos_vcore_back(void) {}
 void hos_vcore_checkpoint(void) {}
 void hos_vcore_yield(void) {}
 int hos_cv_sleep(void *cv, void *lk, unsigned ms) {
-    return SleepConditionVariableSRW((PCONDITION_VARIABLE)cv, (PSRWLOCK)lk, ms, 0);
+    return hos_cond_wait((HosCond *)cv, (HosMutex *)lk, ms);
 }
 #endif

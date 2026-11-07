@@ -28,7 +28,6 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <windows.h>   /* (Linux: host/linux/windows.h) */
 #include <string.h>
 
 #define DEPTH 256
@@ -170,8 +169,8 @@ void hos_setjmp_return(Ctx *c, uint64_t target) {
     for (int i = stack->depth - 1; i >= 0; i--) {
         SjSlot *s = &stack->slot[i];
         if (s->rets[0] != target && s->rets[1] != target && s->rets[2] != target && s->rets[3] != target) continue;
-        static volatile LONG logged;
-        if (InterlockedIncrement(&logged) <= 4)
+        static volatile int32_t logged;
+        if (__atomic_add_fetch(&logged, 1, __ATOMIC_SEQ_CST) <= 4)
             hos_log("longjmp to %#llx (value %llu, %d slots above dropped)", (unsigned long long)target,
                     (unsigned long long)c->x[0], stack->depth - 1 - i);
         s->target = target;

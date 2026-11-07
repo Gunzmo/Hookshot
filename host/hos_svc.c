@@ -6,8 +6,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "hos_sync.h"
+#include "hos_platform.h"
 
 #define R_OK 0
 /* (mkw-recomp) the region of GetInfo 29/30: 128 GB at 192 GB, between the heap (up from 64 GB) and the address
@@ -68,7 +68,7 @@ static uint64_t get_info(uint32_t id0, uint64_t id1, int *ok) {
 typedef struct { HosThread *t; uint64_t mutex, key; uint32_t tag; int on_key; } Waiter;
 static Waiter waiters[1024];
 static int nwaiters;
-static SRWLOCK klock = SRWLOCK_INIT;
+static HosMutex klock = HOS_MUTEX_INIT;
 
 static uint32_t word_get(uint64_t a) { return __atomic_load_n((uint32_t *)GP(a), __ATOMIC_SEQ_CST); }
 static void word_set(uint64_t a, uint32_t v) { __atomic_store_n((uint32_t *)GP(a), v, __ATOMIC_SEQ_CST); }
@@ -144,14 +144,14 @@ static int spin_for_release(uint64_t mutex, uint32_t held) { (void)mutex; (void)
 static uint32_t arbitrate_lock(uint32_t owner, uint64_t mutex, uint32_t tag) {
     HosThread *self = hos_self();
     if (spin_for_release(mutex, owner | HANDLE_WAIT_MASK)) return 0;
-    AcquireSRWLockExclusive(&klock);
+    hos_mutex_lock(&klock);
     if (word_get(mutex) != (owner | HANDLE_WAIT_MASK)) {   /* released meanwhile: let user mode retry */
-        ReleaseSRWLockExclusive(&klock);
+        hos_mutex_unlock(&klock);
         return 0;
     }
     if (nwaiters == 1024) hos_fatal(NULL, "kernel: too many waiters");
     waiters[nwaiters++] = (Waiter){self, mutex, 0, tag, 0};
-    ReleaseSRWLockExclusive(&klock);
+    hos_mutex_unlock(&klock);
     int to;
     hos_thread_wait(self, -1, &to);   /* woken once release_locked made us the owner */
     return 0;
@@ -159,16 +159,16 @@ static uint32_t arbitrate_lock(uint32_t owner, uint64_t mutex, uint32_t tag) {
 
 /* svcArbitrateUnlock(mutex address) */
 static uint32_t arbitrate_unlock(uint64_t mutex) {
-    AcquireSRWLockExclusive(&klock);
+    hos_mutex_lock(&klock);
     release_locked(mutex);
-    ReleaseSRWLockExclusive(&klock);
+    hos_mutex_unlock(&klock);
     return 0;
 }
 
 /* svcWaitProcessWideKeyAtomic(mutex address, key address, own tag, timeout ns) */
 static uint32_t wait_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t timeout) {
     HosThread *self = hos_self();
-    AcquireSRWLockExclusive(&klock);
+    hos_mutex_lock(&klock);
     /* The key says "a waiter" before the mutex is released (as Horizon's kernel does): user mode signals only when it
        reads a nonzero key, so a signaller that took the mutex the moment it was free saw 0, skipped the signal, and
        this thread slept forever (the rare stall while loading: a thread on a key of 1 with its mutex free). */
@@ -176,18 +176,18 @@ static uint32_t wait_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t tim
     if (nwaiters == 1024) hos_fatal(NULL, "kernel: too many waiters");
     waiters[nwaiters++] = (Waiter){self, mutex, key, tag, 1};
     release_locked(mutex);
-    ReleaseSRWLockExclusive(&klock);
+    hos_mutex_unlock(&klock);
     int to;
     hos_thread_wait(self, timeout, &to);
     if (!to) return 0;
-    AcquireSRWLockExclusive(&klock);
+    hos_mutex_lock(&klock);
     int i = find_thread(self);
     if (i >= 0 && waiters[i].on_key) {   /* still waiting on the key: a real timeout; user mode relocks */
         remove_waiter(i);
-        ReleaseSRWLockExclusive(&klock);
+        hos_mutex_unlock(&klock);
         return R_TIMED_OUT;
     }
-    ReleaseSRWLockExclusive(&klock);
+    hos_mutex_unlock(&klock);
     /* signaled meanwhile: either moved to the mutex queue (wait for the hand-over) or already handed the mutex
        (the wake is pending); both end with one wake-up */
     hos_thread_wait(self, -1, &to);
@@ -196,7 +196,7 @@ static uint32_t wait_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t tim
 
 /* svcSignalProcessWideKey(key address, count): count <= 0 wakes all */
 static void signal_key(uint64_t key, int32_t count) {
-    AcquireSRWLockExclusive(&klock);
+    hos_mutex_lock(&klock);
     for (int n = 0; count <= 0 || n < count; n++) {
         int others, i = best_waiter(key, 1, &others);
         if (i < 0) break;
@@ -220,7 +220,7 @@ static void signal_key(uint64_t key, int32_t count) {
     }
     int others;
     if (best_waiter(key, 1, &others) < 0) word_set(key, 0);
-    ReleaseSRWLockExclusive(&klock);
+    hos_mutex_unlock(&klock);
 }
 
 /* ---- (hookshot) the address arbiter: svcWaitForAddress / svcSignalToAddress -----------------------------------
@@ -245,7 +245,7 @@ static void wake_address_locked(uint64_t addr, int32_t count) {
 }
 static uint32_t wait_address(uint64_t addr, uint32_t type, uint64_t value, int64_t timeout) {
     HosThread *self = hos_self();
-    AcquireSRWLockExclusive(&klock);
+    hos_mutex_lock(&klock);
     int wait;
     switch (type) {
     case 0: wait = (int32_t)word_get(addr) < (int32_t)value; break;
@@ -261,31 +261,31 @@ static uint32_t wait_address(uint64_t addr, uint32_t type, uint64_t value, int64
     case 2: wait = (int32_t)word_get(addr) == (int32_t)value; break;
     case 3: wait = __atomic_load_n((uint64_t *)GP(addr), __ATOMIC_SEQ_CST) == value; break;
     default:
-        ReleaseSRWLockExclusive(&klock);
+        hos_mutex_unlock(&klock);
         hos_log("svcWaitForAddress: arbitration type %u", type);
         return R_INVALID_ENUM;
     }
-    if (!wait) { ReleaseSRWLockExclusive(&klock); return R_INVALID_STATE; }
-    if (timeout == 0) { ReleaseSRWLockExclusive(&klock); return R_TIMED_OUT; }
+    if (!wait) { hos_mutex_unlock(&klock); return R_INVALID_STATE; }
+    if (timeout == 0) { hos_mutex_unlock(&klock); return R_TIMED_OUT; }
     if (nwaiters == 1024) hos_fatal(NULL, "kernel: too many waiters");
     waiters[nwaiters++] = (Waiter){self, 0, addr, 0, 2};
-    ReleaseSRWLockExclusive(&klock);
+    hos_mutex_unlock(&klock);
     int to;
     hos_thread_wait(self, timeout, &to);
     if (!to) return 0;
-    AcquireSRWLockExclusive(&klock);
+    hos_mutex_lock(&klock);
     int i = find_thread(self);
     if (i >= 0 && waiters[i].on_key == 2) {   /* still queued: a real timeout */
         remove_waiter(i);
-        ReleaseSRWLockExclusive(&klock);
+        hos_mutex_unlock(&klock);
         return R_TIMED_OUT;
     }
-    ReleaseSRWLockExclusive(&klock);
+    hos_mutex_unlock(&klock);
     hos_thread_wait(self, -1, &to);   /* signaled meanwhile: take the pending wake-up */
     return 0;
 }
 static uint32_t signal_address(uint64_t addr, uint32_t type, int32_t value, int32_t count) {
-    AcquireSRWLockExclusive(&klock);
+    hos_mutex_lock(&klock);
     uint32_t r = 0;
     if (type == 1) {
         if (!word_cas(addr, (uint32_t)value, (uint32_t)value + 1)) r = R_INVALID_STATE;
@@ -300,19 +300,19 @@ static uint32_t signal_address(uint64_t addr, uint32_t type, int32_t value, int3
         } else nv = value + 1;
         if (!word_cas(addr, (uint32_t)value, (uint32_t)nv)) r = R_INVALID_STATE;
     } else if (type != 0) {
-        ReleaseSRWLockExclusive(&klock);
+        hos_mutex_unlock(&klock);
         hos_log("svcSignalToAddress: signal type %u", type);
         return R_INVALID_ENUM;
     }
     if (!r) wake_address_locked(addr, count);
-    ReleaseSRWLockExclusive(&klock);
+    hos_mutex_unlock(&klock);
     return r;
 }
 
 /* Every thread waiting in the kernel's locks and condition variables, with the words they wait on (printed with the
    thread stacks at HOS_EXIT_AFTER: who holds what in a hang). */
 void hos_kernel_dump(void) {
-    AcquireSRWLockExclusive(&klock);
+    hos_mutex_lock(&klock);
     hos_log("kernel: %d threads waiting", nwaiters);
     for (int i = 0; i < nwaiters; i++) {
         const Waiter *w = &waiters[i];
@@ -321,7 +321,7 @@ void hos_kernel_dump(void) {
                 (unsigned long long)w->mutex, w->mutex ? word_get(w->mutex) : 0, (unsigned long long)w->key,
                 w->key ? word_get(w->key) : 0);
     }
-    ReleaseSRWLockExclusive(&klock);
+    hos_mutex_unlock(&klock);
     void hos_thread_log_handles(void);
     hos_thread_log_handles();
 }
@@ -365,13 +365,13 @@ void a64_svc(Ctx *c, uint32_t imm) {
         c->x[0] = R_OK;
         return;
     case 0x0A:   /* ExitThread */
-        hos_vcore_away();
-        ExitThread(0);
+        hos_thread_exit();
         return;
     case 0x07:   /* ExitProcess */
         hos_log("svcExitProcess");
         hos_log_flush();
-        ExitProcess(0);
+        fflush(NULL);
+        _Exit(0);
         return;
     case 0x0C: { /* GetThreadPriority(-, handle) -> (result, priority) */
         HosThread *t = thread_handle((uint32_t)c->x[1]);
@@ -465,16 +465,16 @@ void a64_svc(Ctx *c, uint32_t imm) {
         {   /* (pages under a Vulkan import stay committed, zeroed: hos_mem.c FreeMemoryPages) */
             extern int rx_guest_imported(uint64_t lo, uint64_t hi);
             if (rx_guest_imported(c->x[0], c->x[0] + c->x[1])) memset(GP(c->x[0]), 0, (size_t)c->x[1]);
-            else VirtualFree(GP(c->x[0]), (SIZE_T)c->x[1], MEM_DECOMMIT);
+            else hos_discard_memory(GP(c->x[0]), (size_t)c->x[1]);
         }
         c->x[0] = R_OK;
         return;
     case 0x1F: { /* ConnectToNamedPort(-, name) -> (result, session handle): (hookshot) SDK code that resolves a
                     service through "sm:" (nn::sm::Initialize, from nn::nsd's HIPC client in OoT) gets a session
                     whose requests svc 0x21 answers empty, as for any service the runtime does not emulate. */
-        static volatile LONG next = 0;
+        static volatile int32_t next = 0;
         const char *name = c->x[1] ? (const char *)GP(c->x[1]) : "";
-        uint32_t h = 0x7E000000u | (uint32_t)InterlockedIncrement(&next);
+        uint32_t h = 0x7E000000u | (uint32_t)__atomic_add_fetch(&next, 1, __ATOMIC_SEQ_CST);
         hos_log("ipc: ConnectToNamedPort(\"%.11s\") -> session %#x (requests answered empty) (lr %#llx)", name, h,
                 (unsigned long long)c->x[30]);
         c->x[0] = R_OK;
@@ -490,8 +490,8 @@ void a64_svc(Ctx *c, uint32_t imm) {
         uint32_t cmd = 0;
         for (int off = 8; off < 0x40; off += 4)
             if (*(uint32_t *)(tls + off) == 0x49434653u) { cmd = *(uint32_t *)(tls + off + 8); break; }
-        static volatile LONG logged;
-        if (InterlockedIncrement(&logged) <= 64)
+        static volatile int32_t logged;
+        if (__atomic_add_fetch(&logged, 1, __ATOMIC_SEQ_CST) <= 64)
             hos_log("ipc: handle %#x command %u (hipc %08x %08x, lr %#llx): answered empty", (uint32_t)c->x[0], cmd,
                     w0, w1, (unsigned long long)c->x[30]);
         memset(tls, 0, 0x100);

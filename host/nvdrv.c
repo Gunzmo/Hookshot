@@ -16,8 +16,7 @@
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "hos_sync.h"
 
 void hos_system_event_init(uint64_t key, int autoclear);
 void hos_system_event_signal(uint64_t key);
@@ -26,9 +25,9 @@ enum { NV_OK = 0, NV_NOT_IMPLEMENTED = 1, NV_NOT_SUPPORTED = 2, NV_BAD_PARAMETER
        NV_INSUFFICIENT_MEMORY = 6, NV_BAD_VALUE = 0xB, NV_CONFIG_NOT_FOUND = 0x30006 };
 enum { DEV_NONE, DEV_NVMAP, DEV_AS_GPU, DEV_GPU, DEV_CTRL, DEV_CTRL_GPU, DEV_OTHER };
 
-static SRWLOCK lock = SRWLOCK_INIT;
-#define LOCK() AcquireSRWLockExclusive(&lock)
-#define UNLOCK() ReleaseSRWLockExclusive(&lock)
+static HosRwLock lock = HOS_RWLOCK_INIT;
+#define LOCK() hos_rwlock_write(&lock)
+#define UNLOCK() hos_rwlock_write_unlock(&lock)
 
 /* ---- file descriptors ---------------------------------------------------------------------------------------- */
 typedef struct { int type; char path[48]; int syncpt; } Fd;   /* syncpt: a channel's sync point */
@@ -47,8 +46,8 @@ static const struct { const char *path; int type; } devices[] = {
    then. ------------------------------------------------------------------------------------------------------- */
 #define SYNCPTS 192
 static volatile uint32_t syncpt[SYNCPTS], syncpt_max[SYNCPTS];
-static SRWLOCK sync_lock = SRWLOCK_INIT;
-static CONDITION_VARIABLE sync_cv = CONDITION_VARIABLE_INIT;
+static HosMutex sync_lock = HOS_MUTEX_INIT;
+static HosCond sync_cv = HOS_COND_INIT;
 int hos_gpu_async(void);                                         /* gpu.c */
 static uint64_t ctrl_events[64];   /* user event id -> the SystemEventType the game queried for it */
 static uint8_t ctrl_early[64];     /* a fence on that event passed before the game queried the event: signal it then */
@@ -87,11 +86,11 @@ static int map_floor(uint64_t va) {
     return hi;
 }
 /* a new mapping replaces whatever started inside its range (a remap of the same VA, sparse rebinding) */
-static volatile LONG maps_changed = 1;   /* the mappings changed since hos_gpu_guest_ranges last merged them */
-volatile LONG maps_generation = 1;   /* bumped by every change (hos_gpu_ptr's per-thread cache, the renderer's gpu_read) */
+static volatile int32_t maps_changed = 1;   /* the mappings changed since hos_gpu_guest_ranges last merged them */
+volatile int32_t maps_generation = 1;   /* bumped by every change (hos_gpu_ptr's per-thread cache, the renderer's gpu_read) */
 static void map_add(uint64_t va, uint64_t size, uint64_t guest) {
     maps_changed = 1;
-    InterlockedIncrement(&maps_generation);
+    __atomic_add_fetch(&maps_generation, 1, __ATOMIC_SEQ_CST);
     MAP_LOG("nvdrv: map GPU %#llx..%#llx -> %#llx", (unsigned long long)va, (unsigned long long)(va + size),
             (unsigned long long)guest);
     int i = map_floor(va);
@@ -109,7 +108,7 @@ static void map_add(uint64_t va, uint64_t size, uint64_t guest) {
 }
 static void map_remove(uint64_t va) {
     maps_changed = 1;
-    InterlockedIncrement(&maps_generation);
+    __atomic_add_fetch(&maps_generation, 1, __ATOMIC_SEQ_CST);
     MAP_LOG("nvdrv: unmap GPU %#llx", (unsigned long long)va);
     int i = map_floor(va);
     if (i >= 0 && maps[i].va == va) { memmove(&maps[i], &maps[i + 1], (nmaps - i - 1) * sizeof *maps); nmaps--; }
@@ -162,7 +161,7 @@ void hos_gpu_track(uint64_t guest, uint64_t size, int on) {
         tracked[i] = tracked[--ntracked];
     }
     maps_changed = 1;
-    InterlockedIncrement(&maps_generation);
+    __atomic_add_fetch(&maps_generation, 1, __ATOMIC_SEQ_CST);
     UNLOCK();
 }
 
@@ -247,14 +246,14 @@ uint8_t *hos_gpu_ptr(uint64_t va, uint64_t *avail) {
     }
     /* direct-mapped by 64 KB page (a draw touches more mappings than a short list holds: constant buffers in several
        pools, the header pools, vertex data; a miss is a locked search over ~4000 mappings) */
-    static _Thread_local struct { uint64_t lo, hi, guest; LONG generation; } recent[1024];
-    const LONG generation = maps_generation;
+    static _Thread_local struct { uint64_t lo, hi, guest; int32_t generation; } recent[1024];
+    const int32_t generation = maps_generation;
     const unsigned k = (unsigned)(va >> 16) & 1023;
     if (recent[k].generation == generation && va >= recent[k].lo && va < recent[k].hi) {   /* (most calls) */
         *avail = recent[k].hi - va;
         return (uint8_t *)GP(recent[k].guest + (va - recent[k].lo));
     }
-    AcquireSRWLockShared(&lock);
+    hos_rwlock_read(&lock);
     int i = map_floor(va);
     uint8_t *p = NULL;
     if (i >= 0 && va < maps[i].va + maps[i].size) {
@@ -265,7 +264,7 @@ uint8_t *hos_gpu_ptr(uint64_t va, uint64_t *avail) {
         recent[k].guest = maps[i].guest;
         recent[k].generation = generation;
     }
-    ReleaseSRWLockShared(&lock);
+    hos_rwlock_read_unlock(&lock);
     return p;
 }
 
@@ -276,8 +275,8 @@ void hos_gpu_submit(int channel_fd, const uint64_t *entries, uint32_t n);
 void hos_gpu_queue_submit(int channel_fd, const uint64_t *entries, uint32_t n, int incr_id);
 void hos_gpu_syncpt_incr(uint32_t id) {
     id %= SYNCPTS;
-    AcquireSRWLockExclusive(&sync_lock);
-    uint32_t v = InterlockedIncrement((volatile LONG *)&syncpt[id]);
+    hos_mutex_lock(&sync_lock);
+    uint32_t v = __atomic_add_fetch((volatile int32_t *)&syncpt[id], 1, __ATOMIC_SEQ_CST);
     if ((int32_t)(syncpt_max[id] - v) < 0) syncpt_max[id] = v;   /* increments the kernel did not hand out */
     for (int i = 0; i < 512; i++)
         if (pending[i].used && pending[i].id == id && (int32_t)(v - pending[i].value) >= 0) {
@@ -287,25 +286,25 @@ void hos_gpu_syncpt_incr(uint32_t id) {
             if (ctrl_events[pending[i].slot & 63]) hos_system_event_signal(ctrl_events[pending[i].slot & 63]);
             else ctrl_early[pending[i].slot & 63] = 1;
         }
-    ReleaseSRWLockExclusive(&sync_lock);
-    WakeAllConditionVariable(&sync_cv);
+    hos_mutex_unlock(&sync_lock);
+    hos_cond_broadcast(&sync_cv);
 }
 
 /* Blocks until sync point id reaches value or timeout_ms passes (-1: forever). 1 when it did. */
 static int syncpt_wait(uint32_t id, uint32_t value, int32_t timeout_ms) {
     id %= SYNCPTS;
     int64_t end = timeout_ms < 0 ? INT64_MAX : hos_now_ns() + (int64_t)timeout_ms * 1000000;
-    AcquireSRWLockExclusive(&sync_lock);
+    hos_mutex_lock(&sync_lock);
     for (;;) {
         if ((int32_t)(syncpt[id] - value) >= 0) break;
         int64_t left = end - hos_now_ns();
         if (left <= 0) {
-            ReleaseSRWLockExclusive(&sync_lock);
+            hos_mutex_unlock(&sync_lock);
             return 0;
         }
-        hos_cv_sleep(&sync_cv, &sync_lock, timeout_ms < 0 ? 100 : (DWORD)(left / 1000000 + 1));
+        hos_cv_sleep(&sync_cv, &sync_lock, timeout_ms < 0 ? 100 : (uint32_t)(left / 1000000 + 1));
     }
-    ReleaseSRWLockExclusive(&sync_lock);
+    hos_mutex_unlock(&sync_lock);
     return 1;
 }
 
@@ -483,10 +482,10 @@ static uint32_t ioctl_gpu(int fd, uint32_t group, uint32_t nr, uint64_t p, uint6
            BuildIncrementCommandList): the fence is the value they reach */
         uint32_t v;
         if (hos_gpu_async()) {
-            AcquireSRWLockExclusive(&sync_lock);
+            hos_mutex_lock(&sync_lock);
             if (flags & 2) syncpt_max[sp] += 2;
             v = syncpt_max[sp];
-            ReleaseSRWLockExclusive(&sync_lock);
+            hos_mutex_unlock(&sync_lock);
             hos_gpu_queue_submit(fd, (const uint64_t *)GP(entries), n, (flags & 2) ? sp : -1);
         } else {
             hos_gpu_submit(fd, (const uint64_t *)GP(entries), n);
@@ -531,7 +530,7 @@ static uint32_t ioctl_ctrl(uint32_t nr, uint64_t p) {
             return NV_OK;
         }
         if (hos_gpu_async()) {   /* the event (the value's slot) is signalled when the sync point gets there */
-            AcquireSRWLockExclusive(&sync_lock);
+            hos_mutex_lock(&sync_lock);
             int done = (int32_t)(syncpt[id] - thresh) >= 0;
             int i = 0;
             for (; i < 512 && !done; i++)
@@ -543,7 +542,7 @@ static uint32_t ioctl_ctrl(uint32_t nr, uint64_t p) {
                     break;
                 }
             if (i == 512) hos_log("nvdrv: event wait table full: a fence wait is lost");
-            ReleaseSRWLockExclusive(&sync_lock);
+            hos_mutex_unlock(&sync_lock);
             if (done) {
                 G32(p + 12) = syncpt[id];
                 return NV_OK;
@@ -646,11 +645,11 @@ HLE(_Z17NvOsDrvQueryEventijPN2nn2os15SystemEventTypeE) {
     SYNC_LOG("nvdrv: query event fd %d id %#x", (int)ARG(0), (uint32_t)ARG(1));
     hos_system_event_init(ARG(2), 1);
     uint32_t id = (uint32_t)ARG(1) & 63;
-    AcquireSRWLockExclusive(&sync_lock);
+    hos_mutex_lock(&sync_lock);
     ctrl_events[id] = ARG(2);
     const int early = ctrl_early[id];
     ctrl_early[id] = 0;
-    ReleaseSRWLockExclusive(&sync_lock);
+    hos_mutex_unlock(&sync_lock);
     if (early || !hos_gpu_async()) hos_system_event_signal(ARG(2));   /* (a synchronous GPU never lags) */
     RET(0);
 }

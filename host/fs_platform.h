@@ -70,6 +70,8 @@ static void fs_close(FsFile h) { CloseHandle(h); }
 static int fs_unlink(const char *p) { return DeleteFileA(p) != 0; }
 static void fs_rmdir(const char *p) { RemoveDirectoryA(p); }
 static int fs_rename(const char *a, const char *b) { return MoveFileExA(a, b, MOVEFILE_REPLACE_EXISTING) != 0; }
+/* Save migration must never replace an entry already present at the destination. */
+static int fs_move_new(const char *a, const char *b) { return MoveFileExA(a, b, 0) != 0; }
 #else
 #include <dirent.h>
 #include <errno.h>
@@ -134,6 +136,7 @@ static void fs_close(FsFile fd) { close(fd); }
 static int fs_unlink(const char *p) { return unlink(p) == 0; }
 static void fs_rmdir(const char *p) { (void)rmdir(p); }
 static int fs_rename(const char *a, const char *b) { return rename(a, b) == 0; }
+static int fs_move_new(const char *a, const char *b) { return renameat2(AT_FDCWD, a, AT_FDCWD, b, RENAME_NOREPLACE) == 0; }
 #endif
 
 #define FS_PATH_MAX 260

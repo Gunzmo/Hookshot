@@ -6,19 +6,19 @@
    initializers) is created on first use. Mutexes are always recursive: relocking a non-recursive nn::os mutex
    would be a game bug on hardware anyway. */
 #include "hos.h"
+#include "hos_atomic.h"
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "hos_sync.h"
 
 enum { K_MUTEX = 1, K_COND, K_EVENT, K_SEMA, K_QUEUE, K_RWLOCK, K_MULTIWAIT, K_HOLDER, K_TIMER };
 
 typedef struct Obj {
     uint64_t key;
     int kind;
-    SRWLOCK lk;
-    CONDITION_VARIABLE cv;
+    HosMutex lk;
+    HosCond cv;
     /* mutex / rwlock */
     HosThread *owner;
     int count, readers;
@@ -46,7 +46,7 @@ typedef struct Obj {
 static int wake_lat_on(void);   /* (HOS_WAKE_LAT, below) */
 
 /* ---- the object table: open addressing on the guest address --------------------------------------------- */
-static SRWLOCK table_lock = SRWLOCK_INIT;
+static HosRwLock table_lock = HOS_RWLOCK_INIT;
 static Obj **table;
 static uint64_t *table_keys;   /* each slot's object's key, beside it: a probe compares keys without visiting objects */
 static uint64_t cap, used;
@@ -212,12 +212,12 @@ static Obj *obj_lookup(uint64_t key, int kind) {
     if (!locked_reads) {
         if ((o = find_unlocked(key, kind))) return o;
     } else {
-        AcquireSRWLockShared(&table_lock);
+        hos_rwlock_read(&table_lock);
         o = find_locked(key);
-        ReleaseSRWLockShared(&table_lock);
+        hos_rwlock_read_unlock(&table_lock);
         if (o && o->kind == kind) return o;
     }
-    AcquireSRWLockExclusive(&table_lock);
+    hos_rwlock_write(&table_lock);
     o = find_locked(key);
     if (o && o->kind != kind) { __atomic_store_n(&o->kind, 0, __ATOMIC_RELEASE); o = NULL; }   /* memory reused for another kind of object */
     if (!o && (o = find_dead_locked(key))) {
@@ -235,50 +235,50 @@ static Obj *obj_lookup(uint64_t key, int kind) {
             __atomic_store_n(&o->kind, 0, __ATOMIC_RELAXED);
         } else {
             o = (Obj *)calloc(1, sizeof *o);
+            hos_mutex_init(&o->lk);
+            hos_cond_init(&o->cv);
         }
-        InitializeSRWLock(&o->lk);
-        InitializeConditionVariable(&o->cv);
         __atomic_store_n(&o->key, key, __ATOMIC_RELAXED);
         __atomic_store_n(&o->kind, kind, __ATOMIC_RELEASE);
         insert_locked(o);
     }
-    ReleaseSRWLockExclusive(&table_lock);
+    hos_rwlock_write_unlock(&table_lock);
     return o;
 }
 
 static Obj *fresh(uint64_t key, int kind) {
-    AcquireSRWLockExclusive(&table_lock);
+    hos_rwlock_write(&table_lock);
     Obj *o = find_locked(key);
     if (o) __atomic_store_n(&o->kind, 0, __ATOMIC_RELEASE);   /* re-initialized: forget the old one */
-    ReleaseSRWLockExclusive(&table_lock);
+    hos_rwlock_write_unlock(&table_lock);
     return obj(key, kind);
 }
 
 static void drop(uint64_t key) {
-    AcquireSRWLockExclusive(&table_lock);
+    hos_rwlock_write(&table_lock);
     Obj *o = find_locked(key);
     if (o) __atomic_store_n(&o->kind, 0, __ATOMIC_RELEASE);   /* tombstone (see bury_locked) */
-    ReleaseSRWLockExclusive(&table_lock);
+    hos_rwlock_write_unlock(&table_lock);
 }
 
 /* Wait on o->cv until `deadline` (ns, 0 = forever). Returns 0 on timeout. */
 static int wait_until(Obj *o, int64_t deadline) {
-    if (!deadline) return hos_cv_sleep(&o->cv, &o->lk, INFINITE), 1;
+    if (!deadline) return hos_cv_sleep(&o->cv, &o->lk, HOS_WAIT_FOREVER), 1;
     int64_t left = deadline - hos_now_ns();
     if (left <= 0) return 0;
-    hos_cv_sleep(&o->cv, &o->lk, (DWORD)((left + 999999) / 1000000));
+    hos_cv_sleep(&o->cv, &o->lk, (uint32_t)((left + 999999) / 1000000));
     return 1;
 }
 
 /* ---- multi-wait wake-ups: any event change pokes waiting WaitAny calls --------------------------------- */
-static SRWLOCK mw_lock = SRWLOCK_INIT;
-static CONDITION_VARIABLE mw_cv = CONDITION_VARIABLE_INIT;
-static volatile LONG mw_waiting;
+static HosMutex mw_lock = HOS_MUTEX_INIT;
+static HosCond mw_cv = HOS_COND_INIT;
+static volatile int32_t mw_waiting;
 static void poke_multiwait(void) {
-    if (!InterlockedCompareExchange(&mw_waiting, 0, 0)) return;
-    AcquireSRWLockExclusive(&mw_lock);
-    ReleaseSRWLockExclusive(&mw_lock);
-    WakeAllConditionVariable(&mw_cv);
+    if (!HOS_ATOMIC_CAS(&mw_waiting, 0, 0)) return;
+    hos_mutex_lock(&mw_lock);
+    hos_mutex_unlock(&mw_lock);
+    hos_cond_broadcast(&mw_cv);
 }
 
 #if (defined(__x86_64__) || defined(_M_X64)) && !defined(__EMSCRIPTEN__)
@@ -357,9 +357,9 @@ static int mutex_take(Obj *m, HosThread *self) {
 static void mutex_give(Obj *m) {   /* (the owner's count already 0) */
     __atomic_exchange_n(&m->owner, (HosThread *)NULL, __ATOMIC_SEQ_CST);
     if (__atomic_load_n(&m->mwait, __ATOMIC_SEQ_CST)) {
-        AcquireSRWLockExclusive(&m->lk);
-        ReleaseSRWLockExclusive(&m->lk);
-        WakeConditionVariable(&m->cv);
+        hos_mutex_lock(&m->lk);
+        hos_mutex_unlock(&m->lk);
+        hos_cond_signal(&m->cv);
     }
 }
 static void mutex_lock(Obj *m, uint64_t guest, Ctx *c) {
@@ -373,16 +373,16 @@ static void mutex_lock(Obj *m, uint64_t guest, Ctx *c) {
     if (trace_ms < 0) { const char *e = getenv("HOS_MUTEX_TRACE"); trace_ms = e ? atoi(e) : 0; }
     HosThread *holder = __atomic_load_n(&m->owner, __ATOMIC_RELAXED);
     const int64_t t0 = trace_ms && holder ? hos_now_ns() : 0;
-    AcquireSRWLockExclusive(&m->lk);
+    hos_mutex_lock(&m->lk);
     __atomic_add_fetch(&m->mwait, 1, __ATOMIC_SEQ_CST);
-    while (!mutex_take(m, self)) hos_cv_sleep(&m->cv, &m->lk, INFINITE);
+    while (!mutex_take(m, self)) hos_cv_sleep(&m->cv, &m->lk, HOS_WAIT_FOREVER);
     __atomic_sub_fetch(&m->mwait, 1, __ATOMIC_SEQ_CST);
-    ReleaseSRWLockExclusive(&m->lk);
+    hos_mutex_unlock(&m->lk);
     m->count = 1;
     if (t0) {
         const int64_t waited = hos_now_ns() - t0;
-        static volatile LONG logged;
-        if (waited > (int64_t)trace_ms * 1000000 && InterlockedIncrement(&logged) <= 60)
+        static volatile int32_t logged;
+        if (waited > (int64_t)trace_ms * 1000000 && __atomic_add_fetch(&logged, 1, __ATOMIC_SEQ_CST) <= 60)
             hos_log("mutex %#llx: waited %.1f ms (lr %#llx); held by %s", (unsigned long long)guest, waited / 1e6,
                     (unsigned long long)(c ? c->x[30] : 0), hos_thread_name(holder));
     }
@@ -423,19 +423,19 @@ HLE(_ZN2nn2os27InitializeConditionVariableEPNS0_21ConditionVariableTypeE) { fres
 HLE(_ZN2nn2os25FinalizeConditionVariableEPNS0_21ConditionVariableTypeE) { drop(ARG(0)); }
 HLE(_ZN2nn2os23SignalConditionVariableEPNS0_21ConditionVariableTypeE) {
     Obj *cv = obj(ARG(0), K_COND);
-    AcquireSRWLockExclusive(&cv->lk);
+    hos_mutex_lock(&cv->lk);
     cv->gen++;
-    ReleaseSRWLockExclusive(&cv->lk);
-    WakeConditionVariable(&cv->cv);
+    hos_mutex_unlock(&cv->lk);
+    hos_cond_signal(&cv->cv);
 }
 HLE(_ZN2nn2os21WaitConditionVariableEPNS0_21ConditionVariableTypeEPNS0_9MutexTypeE) {
     Obj *cv = obj(ARG(0), K_COND), *m = obj(ARG(1), K_MUTEX);
-    AcquireSRWLockExclusive(&cv->lk);
+    hos_mutex_lock(&cv->lk);
     uint64_t gen = cv->gen;
     /* release the guest mutex fully while holding the condvar's lock: a signal cannot slip in between */
     const int count = mutex_release_all(m);
-    while (cv->gen == gen) hos_cv_sleep(&cv->cv, &cv->lk, INFINITE);
-    ReleaseSRWLockExclusive(&cv->lk);
+    while (cv->gen == gen) hos_cv_sleep(&cv->cv, &cv->lk, HOS_WAIT_FOREVER);
+    hos_mutex_unlock(&cv->lk);
     mutex_lock(m, 0, NULL);
     m->count = count;
 }
@@ -447,17 +447,17 @@ static void event_init(uint64_t key, int signaled, int clear_mode) {
     e->autoclear = clear_mode == 1;   /* EventClearMode_AutoClear = 1, ManualClear = 0 */
 }
 static void event_signal(Obj *e) {
-    AcquireSRWLockExclusive(&e->lk);
+    hos_mutex_lock(&e->lk);
     e->signaled = 1;
     if (wake_lat_on()) e->sig_ns = hos_now_ns();
-    ReleaseSRWLockExclusive(&e->lk);
-    WakeAllConditionVariable(&e->cv);
+    hos_mutex_unlock(&e->lk);
+    hos_cond_broadcast(&e->cv);
     poke_multiwait();
 }
 static void event_clear(Obj *e) {
-    AcquireSRWLockExclusive(&e->lk);
+    hos_mutex_lock(&e->lk);
     e->signaled = 0;
-    ReleaseSRWLockExclusive(&e->lk);
+    hos_mutex_unlock(&e->lk);
 }
 
 /* HOS_WAKE_LAT=1 (diagnostic): for event and message queue waits by thread, every 5 s: how many found it ready at once,
@@ -469,11 +469,11 @@ static int wake_lat_on(void) {
     return on;
 }
 static void wake_lat_note(int how, int64_t lat_ns) {   /* how: 0 ready, 1 spun, 2 slept */
-    static SRWLOCK lk = SRWLOCK_INIT;
+    static HosMutex lk = HOS_MUTEX_INIT;
     static struct { const char *thread; int64_t n[3], lat, max; } tab[32];
     static int64_t last;
     const char *thread = hos_thread_name(hos_self());
-    AcquireSRWLockExclusive(&lk);
+    hos_mutex_lock(&lk);
     int i = 0;
     while (i < 32 && tab[i].thread && tab[i].thread != thread) i++;
     if (i < 32) {
@@ -494,7 +494,7 @@ static void wake_lat_note(int how, int64_t lat_ns) {   /* how: 0 ready, 1 spun, 
                         (long long)tab[k].n[2], tab[k].lat / 1e3 / (double)tab[k].n[2], tab[k].max / 1e3);
         memset(tab, 0, sizeof tab);
     }
-    ReleaseSRWLockExclusive(&lk);
+    hos_mutex_unlock(&lk);
 }
 
 static int event_wait(Obj *e, int64_t timeout_ns, int try_only) {
@@ -502,17 +502,17 @@ static int event_wait(Obj *e, int64_t timeout_ns, int try_only) {
     const int was_set = e->signaled > 0;
     if (!try_only) spin_until_set(e, &e->signaled);
     int slept = 0;
-    AcquireSRWLockExclusive(&e->lk);
+    hos_mutex_lock(&e->lk);
     const int spun = !was_set && e->signaled;
     while (!e->signaled) {
         if (try_only || (timeout_ns > 0 && !wait_until(e, deadline))) break;
-        if (timeout_ns <= 0) hos_cv_sleep(&e->cv, &e->lk, INFINITE);
+        if (timeout_ns <= 0) hos_cv_sleep(&e->cv, &e->lk, HOS_WAIT_FOREVER);
         slept = 1;
     }
     int got = e->signaled;
     if (got && !try_only && wake_lat_on()) wake_lat_note(slept ? 2 : spun ? 1 : 0, slept ? hos_now_ns() - e->sig_ns : 0);
     if (got && e->autoclear) e->signaled = 0;
-    ReleaseSRWLockExclusive(&e->lk);
+    hos_mutex_unlock(&e->lk);
     return got;
 }
 
@@ -546,11 +546,11 @@ static int logged_wait(Ctx *c, Obj *e, int64_t timeout_ns, int try_only, const c
     const int64_t t0 = hos_now_ns();
     const int r = event_wait(e, timeout_ns, try_only);
     const int64_t took = hos_now_ns() - t0;
-    static SRWLOCK lk = SRWLOCK_INIT;
+    static HosMutex lk = HOS_MUTEX_INIT;
     static struct { uint64_t lr; const char *thread, *what; int64_t n, total, max; } tab[128];
     static int64_t last;
     const char *thread = hos_thread_name(hos_self());
-    AcquireSRWLockExclusive(&lk);
+    hos_mutex_lock(&lk);
     int i = 0;
     while (i < 128 && tab[i].lr && !(tab[i].lr == c->x[30] && tab[i].thread == thread)) i++;
     if (i < 128) {
@@ -576,7 +576,7 @@ static int logged_wait(Ctx *c, Obj *e, int64_t timeout_ns, int try_only, const c
         }
         memset(tab, 0, sizeof tab);
     }
-    ReleaseSRWLockExclusive(&lk);
+    hos_mutex_unlock(&lk);
     return r;
 }
 
@@ -608,11 +608,11 @@ static void who_note_signal(Ctx *c, uint64_t key) {
     int hit = 0;
     for (int i = 0; i < nwho_keys && !hit; i++) hit = who_keys[i] == key;
     if (!hit) return;
-    static SRWLOCK lk = SRWLOCK_INIT;
+    static HosMutex lk = HOS_MUTEX_INIT;
     static struct { uint64_t key, lr; const char *thread; int64_t n; } tab[64];
     static int64_t last;
     const char *thread = hos_thread_name(hos_self());
-    AcquireSRWLockExclusive(&lk);
+    hos_mutex_lock(&lk);
     int i = 0;
     while (i < 64 && tab[i].key && !(tab[i].key == key && tab[i].lr == c->x[30] && tab[i].thread == thread)) i++;
     if (i < 64) {
@@ -627,7 +627,7 @@ static void who_note_signal(Ctx *c, uint64_t key) {
                     (unsigned long long)tab[k].key, tab[k].thread, (unsigned long long)tab[k].lr, (long long)tab[k].n);
         memset(tab, 0, sizeof tab);
     }
-    ReleaseSRWLockExclusive(&lk);
+    hos_mutex_unlock(&lk);
 }
 HLE(_ZN2nn2os16SignalLightEventEPNS0_14LightEventTypeE) {
     who_note_signal(c, ARG(0));
@@ -681,28 +681,28 @@ HLE(_ZN2nn2os18FinalizeTimerEventEPNS0_14TimerEventTypeE) { drop(ARG(0)); }
 /* StartPeriodicTimerEvent(TimerEventType*, TimeSpan first, TimeSpan interval) */
 HLE(_ZN2nn2os23StartPeriodicTimerEventEPNS0_14TimerEventTypeENS_8TimeSpanES3_) {
     Obj *t = obj(ARG(0), K_TIMER);
-    AcquireSRWLockExclusive(&t->lk);
+    hos_mutex_lock(&t->lk);
     t->due_ns = hos_now_ns() + (int64_t)ARG(1);
     t->period_ns = (int64_t)ARG(2);
     t->signaled = 0;
-    WakeAllConditionVariable(&t->cv);   /* (a WaitTimerEvent that came first) */
-    ReleaseSRWLockExclusive(&t->lk);
-    WakeAllConditionVariable(&t->cv);   /* (a first wait that beat this start sleeps on the cv) */
+    hos_cond_broadcast(&t->cv);   /* (a WaitTimerEvent that came first) */
+    hos_mutex_unlock(&t->lk);
+    hos_cond_broadcast(&t->cv);   /* (a first wait that beat this start sleeps on the cv) */
     poke_multiwait();
 }
 HLE(_ZN2nn2os14WaitTimerEventEPNS0_14TimerEventTypeE) {
     Obj *t = obj(ARG(0), K_TIMER);
-    AcquireSRWLockExclusive(&t->lk);
-    while (!t->due_ns) hos_cv_sleep(&t->cv, &t->lk, INFINITE);   /* (the rumble thread can wait before the start, a pad connected at boot) */
+    hos_mutex_lock(&t->lk);
+    while (!t->due_ns) hos_cv_sleep(&t->cv, &t->lk, HOS_WAIT_FOREVER);   /* (the rumble thread can wait before the start, a pad connected at boot) */
     int64_t due = t->due_ns;
-    ReleaseSRWLockExclusive(&t->lk);
+    hos_mutex_unlock(&t->lk);
     hos_sleep_ns(due - hos_now_ns());
-    AcquireSRWLockExclusive(&t->lk);
+    hos_mutex_lock(&t->lk);
     if (t->period_ns > 0) {
         int64_t now = hos_now_ns();
         while (t->due_ns <= now) t->due_ns += t->period_ns;   /* skip missed periods, as a hardware timer would */
     }
-    ReleaseSRWLockExclusive(&t->lk);
+    hos_mutex_unlock(&t->lk);
 }
 
 /* ---- semaphores (normal and light) ------------------------------------------------------------------------ */
@@ -713,17 +713,17 @@ static void sema_init(uint64_t key, int initial, int max) {
 }
 static void sema_acquire(Obj *s) {
     spin_until_set(s, &s->sem);
-    AcquireSRWLockExclusive(&s->lk);
-    while (s->sem <= 0) hos_cv_sleep(&s->cv, &s->lk, INFINITE);
+    hos_mutex_lock(&s->lk);
+    while (s->sem <= 0) hos_cv_sleep(&s->cv, &s->lk, HOS_WAIT_FOREVER);
     s->sem--;
-    ReleaseSRWLockExclusive(&s->lk);
+    hos_mutex_unlock(&s->lk);
 }
 static void sema_release(Obj *s, int n) {
-    AcquireSRWLockExclusive(&s->lk);
+    hos_mutex_lock(&s->lk);
     s->sem += n;
     if (s->sem_max && s->sem > s->sem_max) s->sem = s->sem_max;
-    ReleaseSRWLockExclusive(&s->lk);
-    WakeAllConditionVariable(&s->cv);
+    hos_mutex_unlock(&s->lk);
+    hos_cond_broadcast(&s->cv);
     poke_multiwait();
 }
 HLE(_ZN2nn2os19InitializeSemaphoreEPNS0_13SemaphoreTypeEii) { sema_init(ARG(0), (int)ARG(1), (int)ARG(2)); }
@@ -746,19 +746,19 @@ static void queue_init(uint64_t key, int capacity) {
 /* (mkw-recomp) HOS_QUEUE_TRACE=1: the first 400 puts (thread, queue, value) */
 static void queue_trace(Obj *q, uint64_t v, const char *what) {
     static int on = -1;
-    static volatile LONG n;
+    static volatile int32_t n;
     if (on < 0) on = getenv("HOS_QUEUE_TRACE") != NULL;
-    if (on && InterlockedIncrement(&n) <= 400)
+    if (on && __atomic_add_fetch(&n, 1, __ATOMIC_SEQ_CST) <= 400)
         hos_log("queue: %s %s %#llx value %#llx (len %d)", hos_thread_name(hos_self()), what, (unsigned long long)q->key,
                 (unsigned long long)v, q->qlen);
 }
 /* mode: 0 send (back), 1 jam (front). try: do not block. Returns 1 if done. */
 static int queue_put(Obj *q, uint64_t v, int jam, int try_only) {
     queue_trace(q, v, jam ? "jam" : "send");
-    AcquireSRWLockExclusive(&q->lk);
+    hos_mutex_lock(&q->lk);
     while (q->qlen == q->qcap) {
-        if (try_only) { ReleaseSRWLockExclusive(&q->lk); return 0; }
-        hos_cv_sleep(&q->cv, &q->lk, INFINITE);
+        if (try_only) { hos_mutex_unlock(&q->lk); return 0; }
+        hos_cv_sleep(&q->cv, &q->lk, HOS_WAIT_FOREVER);
     }
     if (jam) {
         q->qhead = (q->qhead + q->qcap - 1) % q->qcap;
@@ -768,8 +768,8 @@ static int queue_put(Obj *q, uint64_t v, int jam, int try_only) {
     }
     q->qlen++;
     if (wake_lat_on()) q->sig_ns = hos_now_ns();
-    ReleaseSRWLockExclusive(&q->lk);
-    WakeAllConditionVariable(&q->cv);
+    hos_mutex_unlock(&q->lk);
+    hos_cond_broadcast(&q->cv);
     poke_multiwait();
     return 1;
 }
@@ -779,11 +779,11 @@ static int queue_get(Obj *q, uint64_t *out, int take, int64_t timeout_ns) {
     const int was_set = q->qlen > 0;
     if (timeout_ns != 0) spin_until_set(q, &q->qlen);
     int slept = 0;
-    AcquireSRWLockExclusive(&q->lk);
+    hos_mutex_lock(&q->lk);
     const int spun = !was_set && q->qlen;
     while (!q->qlen) {
-        if (timeout_ns == 0 || (timeout_ns > 0 && !wait_until(q, deadline))) { ReleaseSRWLockExclusive(&q->lk); return 0; }
-        if (timeout_ns < 0) hos_cv_sleep(&q->cv, &q->lk, INFINITE);
+        if (timeout_ns == 0 || (timeout_ns > 0 && !wait_until(q, deadline))) { hos_mutex_unlock(&q->lk); return 0; }
+        if (timeout_ns < 0) hos_cv_sleep(&q->cv, &q->lk, HOS_WAIT_FOREVER);
         slept = 1;
     }
     if (timeout_ns != 0 && wake_lat_on()) wake_lat_note(slept ? 2 : spun ? 1 : 0, slept ? hos_now_ns() - q->sig_ns : 0);
@@ -792,9 +792,9 @@ static int queue_get(Obj *q, uint64_t *out, int take, int64_t timeout_ns) {
         q->qhead = (q->qhead + 1) % q->qcap;
         q->qlen--;
     }
-    ReleaseSRWLockExclusive(&q->lk);
+    hos_mutex_unlock(&q->lk);
     if (take) {
-        WakeAllConditionVariable(&q->cv);
+        hos_cond_broadcast(&q->cv);
         poke_multiwait();
     }
     return 1;
@@ -843,43 +843,43 @@ HLE(_ZN2nn2os26TimedPeekLightMessageQueueEPmPKNS0_21LightMessageQueueTypeENS_8Ti
 /* ---- reader/writer locks: the write owner may also take read locks and relock for write --------------------- */
 static void rw_read(Obj *l) {
     HosThread *self = hos_self();
-    AcquireSRWLockExclusive(&l->lk);
-    while (l->owner && l->owner != self) hos_cv_sleep(&l->cv, &l->lk, INFINITE);
+    hos_mutex_lock(&l->lk);
+    while (l->owner && l->owner != self) hos_cv_sleep(&l->cv, &l->lk, HOS_WAIT_FOREVER);
     l->readers++;
-    ReleaseSRWLockExclusive(&l->lk);
+    hos_mutex_unlock(&l->lk);
 }
 static int rw_try_read(Obj *l) {
     HosThread *self = hos_self();
-    AcquireSRWLockExclusive(&l->lk);
+    hos_mutex_lock(&l->lk);
     int ok = !l->owner || l->owner == self;
     if (ok) l->readers++;
-    ReleaseSRWLockExclusive(&l->lk);
+    hos_mutex_unlock(&l->lk);
     return ok;
 }
 static void rw_unread(Obj *l) {
-    AcquireSRWLockExclusive(&l->lk);
+    hos_mutex_lock(&l->lk);
     if (l->readers > 0) l->readers--;
-    ReleaseSRWLockExclusive(&l->lk);
-    WakeAllConditionVariable(&l->cv);
+    hos_mutex_unlock(&l->lk);
+    hos_cond_broadcast(&l->cv);
 }
 static int rw_write(Obj *l, int try_only) {
     HosThread *self = hos_self();
-    AcquireSRWLockExclusive(&l->lk);
-    if (l->owner == self) { l->count++; ReleaseSRWLockExclusive(&l->lk); return 1; }
+    hos_mutex_lock(&l->lk);
+    if (l->owner == self) { l->count++; hos_mutex_unlock(&l->lk); return 1; }
     while (l->owner || l->readers) {
-        if (try_only) { ReleaseSRWLockExclusive(&l->lk); return 0; }
-        hos_cv_sleep(&l->cv, &l->lk, INFINITE);
+        if (try_only) { hos_mutex_unlock(&l->lk); return 0; }
+        hos_cv_sleep(&l->cv, &l->lk, HOS_WAIT_FOREVER);
     }
     l->owner = self;
     l->count = 1;
-    ReleaseSRWLockExclusive(&l->lk);
+    hos_mutex_unlock(&l->lk);
     return 1;
 }
 static void rw_unwrite(Obj *l) {
-    AcquireSRWLockExclusive(&l->lk);
+    hos_mutex_lock(&l->lk);
     if (l->owner == hos_self() && --l->count == 0) l->owner = NULL;
-    ReleaseSRWLockExclusive(&l->lk);
-    WakeAllConditionVariable(&l->cv);
+    hos_mutex_unlock(&l->lk);
+    hos_cond_broadcast(&l->cv);
 }
 HLE(_ZN2nn2os26InitializeReaderWriterLockEPNS0_20ReaderWriterLockTypeE) { fresh(ARG(0), K_RWLOCK); }
 HLE(_ZN2nn2os24FinalizeReaderWriterLockEPNS0_20ReaderWriterLockTypeE) { drop(ARG(0)); }
@@ -926,31 +926,31 @@ HLE(_ZN2nn2os26GetMultiWaitHolderUserDataEPKNS0_19MultiWaitHolderTypeE) { RET(ob
 HLE(_ZN2nn2os23FinalizeMultiWaitHolderEPNS0_19MultiWaitHolderTypeE) { drop(ARG(0)); }
 HLE(_ZN2nn2os19LinkMultiWaitHolderEPNS0_13MultiWaitTypeEPNS0_19MultiWaitHolderTypeE) {
     Obj *mw = obj(ARG(0), K_MULTIWAIT), *h = obj(ARG(1), K_HOLDER);
-    AcquireSRWLockExclusive(&mw_lock);
+    hos_mutex_lock(&mw_lock);
     if (mw->nlinks == mw->caplinks) {
         mw->caplinks = mw->caplinks ? mw->caplinks * 2 : 8;
         mw->links = (Obj **)realloc(mw->links, mw->caplinks * sizeof *mw->links);
     }
     mw->links[mw->nlinks++] = h;
     h->mw = mw;
-    ReleaseSRWLockExclusive(&mw_lock);
+    hos_mutex_unlock(&mw_lock);
 }
 HLE(_ZN2nn2os21UnlinkMultiWaitHolderEPNS0_19MultiWaitHolderTypeE) {
     Obj *h = obj(ARG(0), K_HOLDER), *mw = h->mw;
-    AcquireSRWLockExclusive(&mw_lock);
+    hos_mutex_lock(&mw_lock);
     if (mw)
         for (int i = 0; i < mw->nlinks; i++)
             if (mw->links[i] == h) { mw->links[i] = mw->links[--mw->nlinks]; break; }
     h->mw = NULL;
-    ReleaseSRWLockExclusive(&mw_lock);
+    hos_mutex_unlock(&mw_lock);
 }
 /* WaitAny / TimedWaitAny / TryWaitAny -> the first ready holder, or 0. timeout_ns: < 0 forever, 0 try.
    Events signaled through event_signal poke mw_cv; everything else is re-checked every 5 ms. */
 static uint64_t wait_any(uint64_t multiwait, int64_t timeout_ns) {
     Obj *mw = obj(multiwait, K_MULTIWAIT);
     int64_t deadline = timeout_ns > 0 ? hos_now_ns() + timeout_ns : 0;
-    AcquireSRWLockExclusive(&mw_lock);
-    InterlockedIncrement(&mw_waiting);
+    hos_mutex_lock(&mw_lock);
+    __atomic_add_fetch(&mw_waiting, 1, __ATOMIC_SEQ_CST);
     uint64_t found = 0;
     for (;;) {
         int64_t wake = deadline ? deadline : INT64_MAX;
@@ -965,10 +965,10 @@ static uint64_t wait_any(uint64_t multiwait, int64_t timeout_ns) {
         const int64_t now = hos_now_ns();
         if (timeout_ns == 0 || (timeout_ns > 0 && now >= deadline)) break;
         const int64_t left = wake - now;
-        hos_cv_sleep(&mw_cv, &mw_lock, left < 1000000 ? 1 : left < 5000000 ? (DWORD)((left + 999999) / 1000000) : 5);
+        hos_cv_sleep(&mw_cv, &mw_lock, left < 1000000 ? 1 : left < 5000000 ? (uint32_t)((left + 999999) / 1000000) : 5);
     }
-    InterlockedDecrement(&mw_waiting);
-    ReleaseSRWLockExclusive(&mw_lock);
+    __atomic_sub_fetch(&mw_waiting, 1, __ATOMIC_SEQ_CST);
+    hos_mutex_unlock(&mw_lock);
     return found;
 }
 HLE(_ZN2nn2os7WaitAnyEPNS0_13MultiWaitTypeE) { RET(wait_any(ARG(0), -1)); }
@@ -976,14 +976,14 @@ HLE(_ZN2nn2os12TimedWaitAnyEPNS0_13MultiWaitTypeENS_8TimeSpanE) { RET(wait_any(A
 HLE(_ZN2nn2os10TryWaitAnyEPNS0_13MultiWaitTypeE) { RET(wait_any(ARG(0), 0)); }
 HLE(_ZN2nn2os24UnlinkAllMultiWaitHolderEPNS0_13MultiWaitTypeE) {
     Obj *mw = obj(ARG(0), K_MULTIWAIT);
-    AcquireSRWLockExclusive(&mw_lock);
+    hos_mutex_lock(&mw_lock);
     for (int i = 0; i < mw->nlinks; i++) mw->links[i]->mw = NULL;
     mw->nlinks = 0;
-    ReleaseSRWLockExclusive(&mw_lock);
+    hos_mutex_unlock(&mw_lock);
 }
 HLE(_ZN2nn2os22MoveAllMultiWaitHolderEPNS0_13MultiWaitTypeES2_) {
     Obj *to = obj(ARG(0), K_MULTIWAIT), *from = obj(ARG(1), K_MULTIWAIT);
-    AcquireSRWLockExclusive(&mw_lock);
+    hos_mutex_lock(&mw_lock);
     for (int i = 0; i < from->nlinks; i++) {
         if (to->nlinks == to->caplinks) {
             to->caplinks = to->caplinks ? to->caplinks * 2 : 8;
@@ -993,7 +993,7 @@ HLE(_ZN2nn2os22MoveAllMultiWaitHolderEPNS0_13MultiWaitTypeES2_) {
         from->links[i]->mw = to;
     }
     from->nlinks = 0;
-    ReleaseSRWLockExclusive(&mw_lock);
+    hos_mutex_unlock(&mw_lock);
 }
 
 /* ---- system events made by the SDK itself (the game's come from other HLE APIs) ------------------------------- */
@@ -1025,24 +1025,24 @@ HLE(_ZN2nn2os17TryWaitLightEventEPNS0_14LightEventTypeE) { RET(event_wait(obj(AR
 HLE(_ZN2nn2os17TryWaitTimerEventEPNS0_14TimerEventTypeE) {
     Obj *t = obj(ARG(0), K_TIMER);
     int64_t now = hos_now_ns();
-    AcquireSRWLockExclusive(&t->lk);
+    hos_mutex_lock(&t->lk);
     int ready = t->due_ns && now >= t->due_ns;
     if (ready && t->period_ns > 0) while (t->due_ns <= now) t->due_ns += t->period_ns;
-    ReleaseSRWLockExclusive(&t->lk);
+    hos_mutex_unlock(&t->lk);
     RET(ready);
 }
 /* TimedWaitConditionVariable(cv, mutex, TimeSpan) -> ConditionVariableStatus (0 timeout, 1 no timeout) */
 HLE(_ZN2nn2os26TimedWaitConditionVariableEPNS0_21ConditionVariableTypeEPNS0_9MutexTypeENS_8TimeSpanE) {
     Obj *cv = obj(ARG(0), K_COND), *m = obj(ARG(1), K_MUTEX);
     int64_t deadline = hos_now_ns() + ((int64_t)ARG(2) > 0 ? (int64_t)ARG(2) : 0);
-    AcquireSRWLockExclusive(&cv->lk);
+    hos_mutex_lock(&cv->lk);
     uint64_t gen = cv->gen;
     const int count = mutex_release_all(m);
     int signaled = 1;
     while (cv->gen == gen) {
         if (!wait_until(cv, deadline) || hos_now_ns() >= deadline) { signaled = cv->gen != gen; break; }
     }
-    ReleaseSRWLockExclusive(&cv->lk);
+    hos_mutex_unlock(&cv->lk);
     mutex_lock(m, 0, NULL);
     m->count = count;
     RET(signaled);
@@ -1064,30 +1064,30 @@ HLE(_ZN2nn2os22TryReceiveMessageQueueEPmPNS0_16MessageQueueTypeE) {
 HLE(_ZN2nn2os16ReleaseSemaphoreEPNS0_13SemaphoreTypeE) { sema_release(obj(ARG(0), K_SEMA), 1); }
 HLE(_ZN2nn2os19TryAcquireSemaphoreEPNS0_13SemaphoreTypeE) {
     Obj *s = obj(ARG(0), K_SEMA);
-    AcquireSRWLockExclusive(&s->lk);
+    hos_mutex_lock(&s->lk);
     const int ok = s->sem > 0;
     if (ok) s->sem--;
-    ReleaseSRWLockExclusive(&s->lk);
+    hos_mutex_unlock(&s->lk);
     RET(ok);
 }
 /* StartOneShotTimerEvent(TimerEventType*, TimeSpan): a periodic timer without a period */
 HLE(_ZN2nn2os22StartOneShotTimerEventEPNS0_14TimerEventTypeENS_8TimeSpanE) {
     Obj *t = obj(ARG(0), K_TIMER);
-    AcquireSRWLockExclusive(&t->lk);
+    hos_mutex_lock(&t->lk);
     t->due_ns = hos_now_ns() + (int64_t)ARG(1);
     t->period_ns = 0;
     t->signaled = 0;
-    WakeAllConditionVariable(&t->cv);   /* (a WaitTimerEvent that came first) */
-    ReleaseSRWLockExclusive(&t->lk);
-    WakeAllConditionVariable(&t->cv);
+    hos_cond_broadcast(&t->cv);   /* (a WaitTimerEvent that came first) */
+    hos_mutex_unlock(&t->lk);
+    hos_cond_broadcast(&t->cv);
     poke_multiwait();
 }
 /* GenerateRandomBytes(void*, size_t) */
 HLE(_ZN2nn2os19GenerateRandomBytesEPvm) {
     uint8_t *p = (uint8_t *)GP(ARG(0));
-    static volatile LONG64 state = 0x9E3779B97F4A7C15LL;
+    static volatile int64_t state = 0x9E3779B97F4A7C15LL;
     for (uint64_t i = 0; i < ARG(1); i++) {
-        const uint64_t x = (uint64_t)InterlockedAdd64(&state, 0x9E3779B97F4A7C15LL);
+        const uint64_t x = (uint64_t)__atomic_add_fetch(&state, 0x9E3779B97F4A7C15LL, __ATOMIC_SEQ_CST);
         p[i] = (uint8_t)((x ^ (x >> 29) ^ (x >> 47)) * 0xBF58476D1CE4E5B9ULL >> 56);
     }
 }

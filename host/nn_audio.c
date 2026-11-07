@@ -6,7 +6,7 @@
      voices (PCM16, PCM float, DSP-ADPCM; resampled by sample rate x pitch, voice volume)
        -> their destination mix or splitter (per channel pair volumes)
        -> sub mixes in dependency order (sub mix volume, then to their destination)
-       -> the final mix (volume) -> the device sink (its channel map, down to stereo) -> waveOut
+       -> the final mix (volume) -> the device sink (its channel map, down to stereo) -> host audio device
    and signals the renderer event the game's audio thread waits on. Effects are accepted and left out (dry signal);
    aux effects pass through. Played sample counts and released wave buffers go back to the game as on hardware.
    The game's parameter changes take effect together at RequestUpdateAudioRenderer, and volume changes ramp over a
@@ -17,9 +17,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "hos_sync.h"
+#include "hos_platform.h"
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+#include <SDL3/SDL.h>
+#else
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmsystem.h>
+#endif
 
 void hos_system_event_init(uint64_t key, int autoclear);
 void hos_system_event_signal(uint64_t key);
@@ -84,8 +90,7 @@ typedef struct {
     int dropped;
 } Voice;
 
-static CRITICAL_SECTION lock;
-static int lock_ready;
+static HosRecursiveMutex lock = HOS_RECURSIVE_MUTEX_INIT;
 static Voice voices[MAX_VOICES];
 static Mix mixes[MAX_MIXES];
 static Splitter splitters[MAX_SPLITTERS];
@@ -95,10 +100,9 @@ static int lim_enabled;
 static int8_t sink_in[8];
 
 static void au_lock(void) {
-    if (!lock_ready) { InitializeCriticalSection(&lock); lock_ready = 1; }
-    EnterCriticalSection(&lock);
+    hos_recursive_lock(&lock);
 }
-static void au_unlock(void) { LeaveCriticalSection(&lock); }
+static void au_unlock(void) { hos_recursive_unlock(&lock); }
 
 static void put_handle(uint64_t obj, int kind, int index) {
     if (obj) G64(obj) = (uint64_t)AU_MAGIC << 32 | (uint64_t)kind << 24 | (uint32_t)index;
@@ -563,10 +567,14 @@ static void render_frame(int16_t *pcm) {   /* 240 stereo frames */
     }
 }
 
-/* ---- output: waveOut, 10 ms blocks; a WAV file with HOS_AUDIO_DUMP ---------------------------------------------- */
+/* ---- output: SDL on Linux, waveOut on Windows, 10 ms blocks; a WAV file with HOS_AUDIO_DUMP ---------------------------------------------- */
 #define NBLOCKS 10
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+static SDL_AudioStream *wout;
+#else
 static HWAVEOUT wout;
 static WAVEHDR hdr[NBLOCKS];
+#endif
 static int16_t blocks[NBLOCKS][FRAME * 2 * 2];
 static int fill_block, fill_frames;
 static FILE *dump;
@@ -579,6 +587,22 @@ static void output_open(void) {
         fwrite(z, 1, 44, dump);
     }
     if (getenv("HOS_AUDIO") && atoi(getenv("HOS_AUDIO")) == 0) return;
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    void hos_sdl_identity(void);
+    hos_sdl_identity();
+    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "256");
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        hos_log("audio: no output device: %s", SDL_GetError());
+        return;
+    }
+    const SDL_AudioSpec spec = {SDL_AUDIO_S16, 2, RATE};
+    wout = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+    if (!wout || !SDL_ResumeAudioStreamDevice(wout)) {
+        hos_log("audio: no output device: %s", SDL_GetError());
+        if (wout) SDL_DestroyAudioStream(wout);
+        wout = NULL;
+    }
+#else
     WAVEFORMATEX f = {0};
     f.wFormatTag = WAVE_FORMAT_PCM;
     f.nChannels = 2;
@@ -596,6 +620,7 @@ static void output_open(void) {
         hdr[i].dwBufferLength = sizeof blocks[i];
         hdr[i].dwFlags = WHDR_DONE;
     }
+#endif
 }
 static void dump_finish(void) {
     if (!dump) return;
@@ -630,16 +655,26 @@ static void output_frame(const int16_t *pcm) {
         }
     }
     if (!wout) return;
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    /* Ten 10 ms blocks, as on Windows. SDL copies each submitted block. Bound
+       queued input bytes so a stalled device drops frames instead of growing latency. */
+    if (!fill_frames && SDL_GetAudioStreamQueued(wout) > (NBLOCKS - 1) * (int)sizeof blocks[0]) return;
+#else
     WAVEHDR *h = &hdr[fill_block];
     if (fill_frames == 0) {
         if (!(h->dwFlags & WHDR_DONE)) return;   /* the device is behind: this frame is dropped */
         if (h->dwFlags & WHDR_PREPARED) waveOutUnprepareHeader(wout, h, sizeof *h);
     }
+#endif
     memcpy(blocks[fill_block] + fill_frames * FRAME * 2, pcm, FRAME * 4);
     if (++fill_frames == 2) {
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+        SDL_PutAudioStreamData(wout, blocks[fill_block], sizeof blocks[fill_block]);
+#else
         h->dwFlags = 0;
         waveOutPrepareHeader(wout, h, sizeof *h);
         waveOutWrite(wout, h, sizeof *h);
+#endif
         fill_frames = 0;
         fill_block = (fill_block + 1) % NBLOCKS;
     }
@@ -768,26 +803,28 @@ static void commit(void) {   /* (with the lock held) */
 static uint64_t renderer_event;
 static volatile int renderer_running;
 static volatile int64_t elapsed_frames;
-static HANDLE renderer_thread;
+static int renderer_thread;
 
-static DWORD WINAPI renderer_main(void *p) {
+static void renderer_main(void *p) {
     (void)p;
     hos_thread_boost(2);
+    au_lock();
     output_open();
+    au_unlock();
     int64_t period = 5000000, next = hos_now_ns() + period;   /* one audio frame: 240 samples at 48 kHz */
     static int16_t pcm[FRAME * 2];
     for (;;) {
         hos_sleep_ns(next - hos_now_ns());
         next += period;
         if (hos_now_ns() - next > 100000000) next = hos_now_ns() + period;   /* (fell far behind: catch up) */
-        if (!renderer_running) continue;
+        if (!__atomic_load_n(&renderer_running, __ATOMIC_ACQUIRE)) continue;
         au_lock();
         if (ncmds && hos_now_ns() - last_update_ns > 50000000) commit();   /* (no update came: see "parameter updates") */
         render_frame(pcm);
-        au_unlock();
         output_frame(pcm);
-        elapsed_frames++;
+        __atomic_add_fetch(&elapsed_frames, 1, __ATOMIC_RELAXED);
         if (renderer_event) hos_system_event_signal(renderer_event);
+        au_unlock();
     }
 }
 
@@ -796,17 +833,24 @@ static DWORD WINAPI renderer_main(void *p) {
 HLE(_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEventERKNS0_22AudioRendererParameterEPvm) {
     G64(ARG(0)) = 1;
     /* nn::os::SystemEvent (the C++ class) starts with its SystemEventType: key the event on that address */
-    renderer_event = ARG(1);
-    hos_system_event_init(renderer_event, 1);
+    hos_system_event_init(ARG(1), 1);
     au_lock();
+    renderer_event = ARG(1);
+    if (!renderer_thread) renderer_thread = hos_start_worker(renderer_main, NULL);
     au_unlock();
-    if (!renderer_thread) renderer_thread = CreateThread(NULL, 0, renderer_main, NULL, 0, NULL);
+    if (!renderer_thread) { RET(0x1F0); return; }
     hos_log("audio: renderer opened");
     RET(0);
 }
-HLE(_ZN2nn5audio18StartAudioRendererENS0_19AudioRendererHandleE) { renderer_running = 1; RET(0); }
-HLE(_ZN2nn5audio17StopAudioRendererENS0_19AudioRendererHandleE) { renderer_running = 0; }
-HLE(_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE) { renderer_running = 0; renderer_event = 0; dump_finish(); }
+HLE(_ZN2nn5audio18StartAudioRendererENS0_19AudioRendererHandleE) { __atomic_store_n(&renderer_running, 1, __ATOMIC_RELEASE); RET(0); }
+HLE(_ZN2nn5audio17StopAudioRendererENS0_19AudioRendererHandleE) { __atomic_store_n(&renderer_running, 0, __ATOMIC_RELEASE); }
+HLE(_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE) {
+    au_lock();
+    __atomic_store_n(&renderer_running, 0, __ATOMIC_RELEASE);
+    renderer_event = 0;
+    dump_finish();
+    au_unlock();
+}
 HLE(_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19AudioRendererConfigE) {
     au_lock();
     commit();
@@ -814,7 +858,7 @@ HLE(_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19A
     au_unlock();
     RET(0);
 }
-HLE(_ZN2nn5audio33GetAudioRendererElapsedFrameCountEPKNS0_19AudioRendererConfigE) { RET(elapsed_frames); }
+HLE(_ZN2nn5audio33GetAudioRendererElapsedFrameCountEPKNS0_19AudioRendererConfigE) { RET(__atomic_load_n(&elapsed_frames, __ATOMIC_RELAXED)); }
 
 /* Sizes the game allocates for the renderer: generous, never touched by us. */
 HLE(_ZN2nn5audio30GetAudioRendererWorkBufferSizeERKNS0_22AudioRendererParameterE) { RET(0x10000); }

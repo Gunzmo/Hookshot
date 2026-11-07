@@ -6,7 +6,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <windows.h>   /* (the exe's folder; the browser build: the Microsoft C runtime's time functions) */
+#include "hos_platform.h"
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)
+#include <windows.h>
+#else
+#include <strings.h>
+#endif
+
+static int language_equal(const char *a, const char *b) {
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)
+    return _stricmp(a, b);
+#else
+    return strcasecmp(a, b);
+#endif
+}
 
 static int64_t boot_ns;
 
@@ -55,7 +68,7 @@ static const char *desired_language(void) {
                 code[strcspn(code, " \t\r\n")] = 0;
                 int known = 0;
                 for (size_t i = 0; i < sizeof languages / sizeof *languages; i++)
-                    if (!_stricmp(code, languages[i].code)) snprintf(code, sizeof code, "%s", languages[i].code), known = 1;
+                    if (!language_equal(code, languages[i].code)) snprintf(code, sizeof code, "%s", languages[i].code), known = 1;
                 if (!known) continue;
                 snprintf(want, sizeof want, "%s", code);
                 from = "language.txt";
@@ -89,11 +102,11 @@ static int handheld(void) {
     if (v < 0) {
         v = getenv("HOS_HANDHELD") && atoi(getenv("HOS_HANDHELD")) != 0;
         if (!getenv("HOS_HANDHELD")) {   /* (hookshot: the Insert menu's choice, gpu/vk/vk_menu.cpp) */
-            char path[MAX_PATH];
-            const DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+            char path[4096];
+            const size_t n = hos_executable_path(path, sizeof path);
             char *slash = n ? strrchr(path, HOS_SEP) : NULL;
             if (slash) {
-                snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "hookshot_options.ini");
+                snprintf(slash + 1, (size_t)(path + sizeof path - slash - 1), "hookshot_options.ini");
                 FILE *f = fopen(path, "r");
                 if (f) {
                     char line[80];
@@ -163,7 +176,7 @@ HLE(_ZN2nn4time13IsInitializedEv) { RET(1); }
    follows the time) */
 static uint64_t now_posix(void) {
     static int64_t fixed = -1;
-    if (fixed < 0) fixed = getenv("HOS_FIXED_TIME") ? _atoi64(getenv("HOS_FIXED_TIME")) : 0;
+    if (fixed < 0) fixed = getenv("HOS_FIXED_TIME") ? strtoll(getenv("HOS_FIXED_TIME"), NULL, 10) : 0;
     return fixed ? (uint64_t)(fixed + hos_now_ns() / 1000000000LL) : (uint64_t)time(NULL);
 }
 HLE(_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE) { G64(ARG(0)) = now_posix(); RET(0); }
@@ -208,7 +221,11 @@ HLE(_ZN2nn3nsd24GetEnvironmentIdentifierEPNS0_21EnvironmentIdentifierE) {
 static void calendar(uint64_t out, uint64_t info, int64_t posix, int local) {
     time_t t = (time_t)posix;
     struct tm tmv;
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)
     if (local) localtime_s(&tmv, &t); else gmtime_s(&tmv, &t);
+#else
+    if (local) localtime_r(&t, &tmv); else gmtime_r(&t, &tmv);
+#endif
     /* CalendarTime { s16 year; s8 month, day, hour, minute, second; pad } */
     uint8_t ct[8] = {0};
     int16_t year = (int16_t)(tmv.tm_year + 1900);
@@ -244,7 +261,11 @@ HLE(_ZN2nn4time18ToPosixTimeFromUtcERKNS0_12CalendarTimeE) {
     memcpy(&year, ct, 2);
     tmv.tm_year = year - 1900; tmv.tm_mon = ct[2] - 1; tmv.tm_mday = ct[3];
     tmv.tm_hour = ct[4]; tmv.tm_min = ct[5]; tmv.tm_sec = ct[6];
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)
     RET((uint64_t)_mkgmtime(&tmv));
+#else
+    RET((uint64_t)timegm(&tmv));
+#endif
 }
 /* ClockSnapshot: an opaque 0xD0-byte record; ours holds the POSIX time at +0 */
 HLE(_ZN2nn4time13ClockSnapshotC1Ev) { memset(GP(ARG(0)), 0, 0xD0); }

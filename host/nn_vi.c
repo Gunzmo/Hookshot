@@ -2,8 +2,8 @@
    layer, and the display's vsync event, signaled at 60 Hz by a host thread. HDR and VRR are reported unsupported,
    so the game takes its SDR path. Frames are paced at the native NVN layer's window acquire (the end of this file). */
 #include "hos.h"
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "hos_sync.h"
+#include "hos_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,10 +13,11 @@ void hos_system_event_signal(uint64_t key);
 
 static uint64_t display, layer;
 static uint64_t vsync_events[8];
-static volatile LONG nvsync;
-static HANDLE vsync_thread;
+static volatile int32_t nvsync;
+static int vsync_thread;
+static HosMutex vsync_lock = HOS_MUTEX_INIT;
 
-static DWORD WINAPI vsync_main(void *p) {
+static void vsync_main(void *p) {
     (void)p;
     const int64_t period = 1000000000LL / 60;
     int64_t next = hos_now_ns() + period;
@@ -25,9 +26,10 @@ static DWORD WINAPI vsync_main(void *p) {
         if (next > now) hos_sleep_ns(next - now);
         next += period;
         if (next < hos_now_ns()) next = hos_now_ns() + period;   /* (fell behind: no burst of vsyncs) */
-        for (LONG i = 0; i < nvsync; i++) hos_system_event_signal(vsync_events[i]);
+        const int count = __atomic_load_n(&nvsync, __ATOMIC_ACQUIRE);
+        for (int i = 0; i < count; i++) hos_system_event_signal(vsync_events[i]);
     }
-    return 0;
+    return;
 }
 
 /* nn::vi::Initialize() */
@@ -50,11 +52,15 @@ HLE(_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE) {
 /* nn::vi::GetDisplayVsyncEvent(nn::os::SystemEventType*, nn::vi::Display*) -> Result */
 HLE(_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE) {
     hos_system_event_init(ARG(0), 1);
-    if (nvsync < (LONG)(sizeof vsync_events / sizeof vsync_events[0])) {
-        vsync_events[nvsync] = ARG(0);
-        InterlockedIncrement(&nvsync);
+    hos_mutex_lock(&vsync_lock);
+    const int count = __atomic_load_n(&nvsync, __ATOMIC_RELAXED);
+    if (count < (int)(sizeof vsync_events / sizeof vsync_events[0])) {
+        vsync_events[count] = ARG(0);
+        __atomic_store_n(&nvsync, count + 1, __ATOMIC_RELEASE);
     }
-    if (!vsync_thread) vsync_thread = CreateThread(NULL, 0, vsync_main, NULL, 0, NULL);
+    if (!vsync_thread) vsync_thread = hos_start_worker(vsync_main, NULL);
+    hos_mutex_unlock(&vsync_lock);
+    if (!vsync_thread) { RET(0x1F0); return; }
     RET(0);
 }
 
@@ -96,7 +102,7 @@ HLE(_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE) {
    HOS_NO_PACING=1: as fast as it can. */
 static volatile int present_interval = 1;
 static int64_t next_frame_at, window_start, frames_in_window;
-static volatile LONG64 presents;
+static volatile int64_t presents;
 int hos_vi_native_interval(Ctx *c, int requested) {
     (void)c;
     present_interval = requested < 1 ? 1 : requested > 4 ? 4 : requested;
@@ -111,7 +117,7 @@ int hos_vi_native_interval(Ctx *c, int requested) {
    frame over 16.7 ms to the next vsync step (gameplay at 27 ms frames, 5 ms of them in this sleep). HOS_VI_DOUBLE=1:
    that behaviour */
 static int64_t shown_at[16];
-static volatile LONG64 shown_count;
+static volatile int64_t shown_count;
 void hos_vi_native_acquire(int active) {
     static int no_pacing = -1, double_buffered = -1;
     if (no_pacing < 0) no_pacing = getenv("HOS_NO_PACING") != NULL;
@@ -150,18 +156,18 @@ static void scan_dt(long long presents) {
     if (!f) return;
     size_t hits = 0;
     for (uint64_t a = 0x80000000ULL; a < 0x2000000000ULL && hits < 4000000;) {
-        MEMORY_BASIC_INFORMATION m;
-        if (!VirtualQuery(GP(a), &m, sizeof m)) break;
-        const uint64_t size = m.RegionSize;
-        if (m.State == MEM_COMMIT && (m.Protect & PAGE_READWRITE)) {
-            const uint32_t *w = (const uint32_t *)m.BaseAddress;
+        HosMemoryRegion m;
+        if (!hos_memory_region(GP(a), &m)) break;
+        const uint64_t size = m.size;
+        if (m.readable && m.writable) {
+            const uint32_t *w = (const uint32_t *)m.base;
             for (size_t i = 0; i < size / 4; i++)
                 if (w[i] >= 0x3c800000 && w[i] <= 0x3d230000) {
                     fprintf(f, "%llx %08x\n", (unsigned long long)((uint8_t *)&w[i] - (uint8_t *)GP(0)), w[i]);
                     if (++hits >= 4000000) break;
                 }
         }
-        a = (uint64_t)((uint8_t *)m.BaseAddress - (uint8_t *)GP(0)) + size;
+        a = (uint64_t)((uint8_t *)m.base - (uint8_t *)GP(0)) + size;
     }
     fclose(f);
     hos_log("vi: scan %s: %zu floats", name, hits);
@@ -258,7 +264,7 @@ void hos_vi_native_presented(void) {
         shown_at[n & 15] = last + period > now ? last + period : now;
         shown_count = n + 1;
     }
-    const int64_t n = InterlockedIncrement64(&presents);
+    const int64_t n = __atomic_add_fetch(&presents, 1, __ATOMIC_SEQ_CST);
     {   /* HOS_MKW_INTERVAL=<0|1|2>: the interval MKW's pacer is held at, through its own override (+0x210, any
            non-zero value is used as the interval): 1 (the default): a steady 60 fps; 2: 30; 0: the game's choice,
            which with frames between 16.7 and 33 ms swings between the two (25-27 fps, stutters). Its timing counts

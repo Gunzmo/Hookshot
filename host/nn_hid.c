@@ -19,13 +19,19 @@
    Npad states share one layout (NpadCommonState): { s64 sampling; u64 buttons; s32 lx, ly; s32 rx, ry; u32 attributes;
    pad } = 0x28 bytes. */
 #include "hos.h"
+#include "hos_atomic.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "hos_platform.h"
+#include "hos_atomic.h"
+#include "hos_input.h"
+#if !defined(__linux__) || defined(__EMSCRIPTEN__)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <xinput.h>
+#endif
 #include "../gpu/vk/vk_api.h"   /* (the controls' names: HOS_SW_*, HOS_PAD_*) */
 
 enum { B_A = 0, B_B, B_X, B_Y, B_LS, B_RS, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS, B_LEFT, B_UP, B_RIGHT, B_DOWN };
@@ -34,13 +40,21 @@ enum { B_A = 0, B_B, B_X, B_Y, B_LS, B_RS, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS
 #define STYLE_FULLKEY 1u
 #define ATTR_CONNECTED 1u
 
+#if !defined(__linux__) || defined(__EMSCRIPTEN__)
 typedef DWORD(WINAPI *XInputGetStateFn)(DWORD, XINPUT_STATE *);
 static XInputGetStateFn xinput_get;
+#endif
 static int64_t sampling;
 
 int rx_option(int id, int otherwise);
 /* (the Insert menu takes the keyboard while it is open) */
-static int key(int vk) { return !rx_option(1, 0) && (GetAsyncKeyState(vk) & 0x8000) != 0; }
+static int key(int vk) {
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    return !rx_option(1, 0) && hos_linux_key_down(vk);
+#else
+    return !rx_option(1, 0) && (GetAsyncKeyState(vk) & 0x8000) != 0;
+#endif
+}
 
 int hos_mouse_take(int32_t *dx, int32_t *dy);   /* display.c */
 
@@ -57,7 +71,7 @@ static void mouse_sens_save(void) {
 
 static void mouse_sens_keys(void) {
     static int prev_minus, prev_plus;
-    const int minus = key(VK_OEM_MINUS) || key(VK_SUBTRACT), plus = key(VK_OEM_PLUS) || key(VK_ADD);
+    const int minus = key(HOS_KEY_OEM_MINUS) || key(HOS_KEY_SUBTRACT), plus = key(HOS_KEY_OEM_PLUS) || key(HOS_KEY_ADD);
     if (minus && !prev_minus) { hos_mouse_sens *= 0.8; mouse_sens_save(); }
     if (plus && !prev_plus) { hos_mouse_sens *= 1.25; mouse_sens_save(); }
     if (hos_mouse_sens < 0.05) hos_mouse_sens = 0.05;
@@ -165,6 +179,9 @@ static int mouse_stick(int32_t *rx, int32_t *ry, int pointing) {
 }
 
 static int game_in_front(void) {
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    return hos_linux_has_focus();
+#else
     DWORD pid = 0;
     HWND w = GetForegroundWindow();
     if (w) GetWindowThreadProcessId(w, &pid);
@@ -188,6 +205,7 @@ static int game_in_front(void) {
     }
 #endif
     return front;
+#endif
 }
 
 /* HOS_INPUT_SCRIPT, and HOS_INPUT_LIVE=<file>: lines appended to that file while the game runs are presses in the
@@ -329,30 +347,30 @@ static const signed char pad_default[HOS_SW_N] = {
     HOS_PAD_RIGHT, HOS_PAD_DOWN};
 /* (the keys of totk-pc-recomp's docs/controls.md, github.com/valentderah/totk-pc-recomp, MIT; plus Enter for Plus) */
 static const unsigned char key_default[HOS_SW_N][2] = {
-    {'E'}, {VK_SHIFT}, {VK_SPACE}, {0}, {VK_CONTROL}, {'C'}, {'Q'}, {'R'}, {'Z'}, {'X', 'F'}, {VK_TAB, VK_RETURN},
+    {'E'}, {HOS_KEY_SHIFT}, {HOS_KEY_SPACE}, {0}, {HOS_KEY_CONTROL}, {'C'}, {'Q'}, {'R'}, {'Z'}, {'X', 'F'}, {HOS_KEY_TAB, HOS_KEY_RETURN},
     {'M'}, {'1'}, {'2'}, {'3'}, {'4'}};
-static volatile LONG pad_bind[HOS_SW_N], key_bind[HOS_SW_N][2];
+static volatile int32_t pad_bind[HOS_SW_N], key_bind[HOS_SW_N][2];
 
 static void binds_default(void) {
     for (int i = 0; i < HOS_SW_N; i++) {
-        InterlockedExchange(&pad_bind[i], pad_default[i]);
-        for (int k = 0; k < 2; k++) InterlockedExchange(&key_bind[i][k], key_default[i][k]);
+        __atomic_exchange_n(&pad_bind[i], pad_default[i], __ATOMIC_SEQ_CST);
+        for (int k = 0; k < 2; k++) __atomic_exchange_n(&key_bind[i][k], key_default[i][k], __ATOMIC_SEQ_CST);
     }
 }
 static void binds_load(void) {
-    static volatile LONG state;   /* 0 not read, 1 being read, 2 read */
-    if (state == 2) return;
-    if (InterlockedCompareExchange(&state, 1, 0) != 0) {
-        while (state != 2) Sleep(0);
+    static volatile int32_t state;   /* 0 not read, 1 being read, 2 read */
+    if (__atomic_load_n(&state, __ATOMIC_ACQUIRE) == 2) return;
+    if (HOS_ATOMIC_CAS(&state, 1, 0) != 0) {
+        while (__atomic_load_n(&state, __ATOMIC_ACQUIRE) != 2) hos_yield();
         return;
     }
     binds_default();
-    char path[MAX_PATH];
-    const DWORD len = GetModuleFileNameA(NULL, path, MAX_PATH);
+    char path[4096];
+    const size_t len = hos_executable_path(path, sizeof path);
     char *slash = len ? strrchr(path, HOS_SEP) : NULL;
     FILE *f = NULL;
     if (slash) {
-        snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "hookshot_options.ini");
+        snprintf(slash + 1, (size_t)(path + sizeof path - slash - 1), "hookshot_options.ini");
         f = fopen(path, "r");
     }
     if (f) {
@@ -366,18 +384,18 @@ static void binds_load(void) {
                 if (strcmp(line + 4, bind_names[i])) continue;
                 if (pad) {
                     const int v = atoi(eq + 1);
-                    InterlockedExchange(&pad_bind[i], v >= 0 && v < HOS_PAD_N ? v : -1);
+                    __atomic_exchange_n(&pad_bind[i], v >= 0 && v < HOS_PAD_N ? v : -1, __ATOMIC_SEQ_CST);
                 } else {
                     char *comma = strchr(eq + 1, ',');
                     const int a = atoi(eq + 1), b = comma ? atoi(comma + 1) : 0;
-                    InterlockedExchange(&key_bind[i][0], a > 0 && a < 256 ? a : 0);
-                    InterlockedExchange(&key_bind[i][1], b > 0 && b < 256 ? b : 0);
+                    __atomic_exchange_n(&key_bind[i][0], a > 0 && a < 256 ? a : 0, __ATOMIC_SEQ_CST);
+                    __atomic_exchange_n(&key_bind[i][1], b > 0 && b < 256 ? b : 0, __ATOMIC_SEQ_CST);
                 }
             }
         }
         fclose(f);
     }
-    InterlockedExchange(&state, 2);
+    __atomic_exchange_n(&state, 2, __ATOMIC_SEQ_CST);
 }
 int hos_binding(int set, int button, int slot) {
     binds_load();
@@ -395,24 +413,27 @@ void hos_bind(int set, int button, int slot, int code) {
     if (button >= HOS_SW_N || slot < 0 || slot > 1) return;
     if (set == HOS_BIND_PAD) {
         if (slot || code < -1 || code >= HOS_PAD_N) return;
-        const LONG old = pad_bind[button];
+        const int32_t old = pad_bind[button];
         for (int i = 0; i < HOS_SW_N; i++)
-            if (i != button && code >= 0 && pad_bind[i] == code) InterlockedExchange(&pad_bind[i], old);
-        InterlockedExchange(&pad_bind[button], code);
+            if (i != button && code >= 0 && pad_bind[i] == code) __atomic_exchange_n(&pad_bind[i], old, __ATOMIC_SEQ_CST);
+        __atomic_exchange_n(&pad_bind[button], code, __ATOMIC_SEQ_CST);
     } else {
         if (code < 0 || code > 255) return;
         for (int i = 0; i < HOS_SW_N; i++)
             for (int k = 0; k < 2; k++)
-                if (code && key_bind[i][k] == code) InterlockedExchange(&key_bind[i][k], 0);
-        InterlockedExchange(&key_bind[button][slot], code);
+                if (code && key_bind[i][k] == code) __atomic_exchange_n(&key_bind[i][k], 0, __ATOMIC_SEQ_CST);
+        __atomic_exchange_n(&key_bind[button][slot], code, __ATOMIC_SEQ_CST);
     }
 }
-static volatile LONG pad_raw_now;   /* the gamepads' inputs at the last read, 1 << HOS_PAD_* */
+static volatile int32_t pad_raw_now;   /* the gamepads' inputs at the last read, 1 << HOS_PAD_* */
 uint32_t hos_pad_raw(void) { return (uint32_t)pad_raw_now; }
 
 static void pads_read(uint64_t *buttons, int32_t stick[4]) {
-    static int64_t next_read, retry[XUSER_MAX_COUNT];
+    static int64_t next_read;
+#if !defined(__linux__) || defined(__EMSCRIPTEN__)
+    static int64_t retry[XUSER_MAX_COUNT];
     static int was_connected[XUSER_MAX_COUNT];
+#endif
     static uint64_t cached_buttons;
     static int32_t cached_stick[4];
     const int64_t now = hos_now_ns();
@@ -431,6 +452,7 @@ static void pads_read(uint64_t *buttons, int32_t stick[4]) {
         if (n != was) hos_log("hid: %d controller%s through SDL", n, n == 1 ? "" : "s");
         was = n;
     }
+#if !defined(__linux__) || defined(__EMSCRIPTEN__)
 #ifdef __EMSCRIPTEN__
     xinput_get = XInputGetState;
 #endif
@@ -475,7 +497,8 @@ static void pads_read(uint64_t *buttons, int32_t stick[4]) {
         }
         stick_max(s, v);
     }
-    InterlockedExchange(&pad_raw_now, (LONG)raw);
+#endif
+    __atomic_exchange_n(&pad_raw_now, (int32_t)raw, __ATOMIC_SEQ_CST);
     /* Back and Start together open the Insert menu (gpu/vk/vk_menu.cpp, for pads whose Home button the system
        keeps): they reach the game only one at a time */
     const uint64_t chord = 1ULL << HOS_PAD_BACK | 1ULL << HOS_PAD_START;
@@ -526,7 +549,7 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
     static int armed[2];
     if (mouse_stick(&mouse[2], &mouse[3], (int)(*buttons >> B_L & 1))) {
         stick_max(stick, mouse);
-        const int vk[2] = {VK_LBUTTON, VK_RBUTTON}, b[2] = {B_Y, B_ZL};
+        const int vk[2] = {HOS_KEY_LBUTTON, HOS_KEY_RBUTTON}, b[2] = {B_Y, B_ZL};
         for (int i = 0; i < 2; i++) {
             if (!key(vk[i])) armed[i] = 1;
             else if (armed[i]) *buttons |= 1ULL << b[i];
@@ -535,8 +558,8 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
         armed[0] = armed[1] = 0;
     }
     /* (WASD the left stick; the arrows or IJKL the camera) */
-    const int cx = (key(VK_RIGHT) || key('L')) - (key(VK_LEFT) || key('J')),
-              cy = (key(VK_UP) || key('I')) - (key(VK_DOWN) || key('K'));
+    const int cx = (key(HOS_KEY_RIGHT) || key('L')) - (key(HOS_KEY_LEFT) || key('J')),
+              cy = (key(HOS_KEY_UP) || key('I')) - (key(HOS_KEY_DOWN) || key('K'));
     const int32_t keys[4] = {(key('D') - key('A')) * 32767, (key('W') - key('S')) * 32767, cx * 32767, cy * 32767};
     stick_max(stick, keys);
 }
@@ -698,9 +721,9 @@ HLE(_ZN2nn3hid6detail28FlushEnqueuedVibrationValuesEv) { RET(0); }
    runtime does not have). TouchScreenState<16>: {s64 sampling number, s32 count, s32 reserved, TouchState[16]}. */
 HLE(_ZN2nn3hid21InitializeTouchScreenEv) {}
 HLE(_ZN2nn3hid20GetTouchScreenStatesILm16EEEiPNS0_16TouchScreenStateIXT_EEEi) {
-    static volatile LONG64 sampling;
+    static volatile int64_t sampling;
     if ((int)ARG(1) < 1) { RET(0); return; }
     memset(GP(ARG(0)), 0, 16 + 16 * 0x28);
-    G64(ARG(0)) = (uint64_t)InterlockedIncrement64(&sampling);
+    G64(ARG(0)) = (uint64_t)__atomic_add_fetch(&sampling, 1, __ATOMIC_SEQ_CST);
     RET(1);
 }

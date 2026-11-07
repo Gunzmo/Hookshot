@@ -22,13 +22,35 @@ for the Vulkan back end, Eden's CPM package cache (found in mkw-recomp's `work/e
 Run everything with `python -I` from this folder.
 
 Targets (`nx2/target.py`): `build.py` and `make_game.py` take `--target windows` (the default; `RX_TARGET`) or `linux`.
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:a21eec2bac36b4d139ec7f53ef6f189c4a0e395a0c76c7ad9b7761a90279205a -->
+
 From a Linux PC, `windows` is a cross-build with the system's clang and lld-link over a /winsysroot-style copy of
 Microsoft's C library and Windows SDK (`scripts/setup-winsysroot.sh`, xwin; `RX_WINSYSROOT`, default
 `~/.local/share/hookshot/winsysroot`), and the game runs with Proton or Wine. `linux` is native: `hookshot_rt` +
-`libhookshot_vk.so`. The host's Win32 calls are answered by `host/linux` (`windows.h` and `win32.c`: Win32 over
-POSIX), the window, keyboard and mouse are SDL3's (`host/linux/display_sdl.c`, Wayland first, else X11), waveOut plays
-through SDL3's audio, and the controllers are SDL3's on both systems (`host/pad_sdl.c`). The tools that run during the
-build (zbic, the tests) are always built for the PC they run on.
+`libhookshot_vk.so`. Linux host services use POSIX files and directory streams, pthread mutexes and reader/writer
+locks, monotonic clocks, native thread wakeups and completion waits, and fibers with guarded stacks on `ucontext`.
+The window, keyboard, mouse, controllers and audio output use SDL3 directly; controller events stay on the window's
+thread. Audio queues at most ten 10 ms blocks and continues to support `HOS_AUDIO_DUMP` and `HOS_AUDIO=0`.
+`host/hos_sync.h` and `host/hos_platform.*` retain Windows implementations of the shared host interfaces.
+`host/linux/windows.h` and `win32.c` remain for renderer interfaces and diagnostic hooks that still consume the
+Win32 API. The tools that run during the build (zbic, the tests) are always built for the PC they run on.
+
+Native host checks need no game dump or window server:
+
+```sh
+python -I -B tests/test_host_linux.py --core-only
+python -I -B tests/test_nn_fs_linux.py
+# Also check virtual gamepads, rumble, dummy audio and PCM dumps (requires SDL3 development files and pkg-config):
+python -I -B tests/test_host_linux.py
+```
+
+The core checks cover host-call publication, guest queues, recursive mutexes and condition waits, events, thread
+exit and repeated waits, virtual cores, fiber migration between OS threads, native memory operations, and startup
+save migration, including destination collisions and copies between filesystems when available.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 ### Dependencies and release folders
 

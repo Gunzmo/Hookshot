@@ -1,6 +1,7 @@
 /* Guest memory map: the system region (our own objects), the heap, address regions.
    The whole 4 GB window is committed up front (hos_main.c), so "mapping" here is only bookkeeping and zeroing. */
 #include "hos.h"
+#include "hos_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,7 +14,6 @@ static SRWLOCK lock = SRWLOCK_INIT;
 #else
 #include <pthread.h>
 #include <sys/mman.h>
-#include <windows.h>   /* (hookshot) Linux: host/linux/windows.h (VirtualFree) */
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 #define LOCK() pthread_mutex_lock(&lock)
 #define UNLOCK() pthread_mutex_unlock(&lock)
@@ -284,7 +284,7 @@ HLE(_ZN2nn2os15FreeMemoryPagesEmm) {
            still maps them, and decommitted pages under an import faulted the device. Read as zero, as freed pages) */
         extern int rx_guest_imported(uint64_t lo, uint64_t hi);
         if (hi > lo && rx_guest_imported(lo, hi)) memset(GP(lo), 0, (size_t)(hi - lo));
-        else if (hi > lo) VirtualFree(GP(lo), (SIZE_T)(hi - lo), MEM_DECOMMIT);
+        else if (hi > lo) hos_discard_memory(GP(lo), (size_t)(hi - lo));
         RET(0);
         return;
     }

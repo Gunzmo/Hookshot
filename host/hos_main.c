@@ -12,6 +12,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "hos_platform.h"
+#include "fs_platform.h"
+#include "hos_input.h"
 #if defined(_WIN32) || defined(__EMSCRIPTEN__)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -21,7 +24,6 @@
 #endif
 #else
 #include <sys/mman.h>
-#include <windows.h>   /* (hookshot) Linux: host/linux/windows.h */
 #endif
 
 #ifdef A64_MEM_ZERO
@@ -149,8 +151,7 @@ static void call_guest(Ctx *c, uint64_t addr, uint64_t sp, const char *what) {
    executable is moved there the first time, entry by entry (the folder may hold other things already), and a note
    beside the executable says where. Anything that cannot be moved keeps the old place. --user <dir> still wins */
 static int is_dir(const char *p) {
-    const DWORD a = GetFileAttributesA(p);
-    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+    return fs_type(p) == 1;
 }
 /* (to another disk, where a rename cannot go: copied, then the original removed) */
 static int copy_tree(const char *from, const char *to) {
@@ -164,51 +165,47 @@ static int copy_tree(const char *from, const char *to) {
         if (out && fclose(out)) ok = 0;
         return ok;
     }
-    if (!CreateDirectoryA(to, NULL)) return 0;
-    char pattern[MAX_PATH];
-    snprintf(pattern, sizeof pattern, "%s" HOS_SEP_S "*", from);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    int ok = 1;
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
-            char a[MAX_PATH], b[MAX_PATH];
-            snprintf(a, sizeof a, "%s" HOS_SEP_S "%s", from, fd.cFileName);
-            snprintf(b, sizeof b, "%s" HOS_SEP_S "%s", to, fd.cFileName);
-            ok = copy_tree(a, b);
-        } while (ok && FindNextFileA(h, &fd));
-        FindClose(h);
+    if (fs_mkdir(to) != 0) return 0;
+    FsDir dir;
+    if (!fs_dir_open(&dir, from)) return 0;
+    int ok = 1, directory;
+    uint64_t size;
+    char name[HOS_PATH_MAX];
+    while (ok && fs_dir_next(&dir, name, sizeof name, &directory, &size)) {
+        if (!strcmp(name, ".") || !strcmp(name, "..")) continue;
+        char a[HOS_PATH_MAX], b[HOS_PATH_MAX];
+        snprintf(a, sizeof a, "%s" HOS_SEP_S "%s", from, name);
+        snprintf(b, sizeof b, "%s" HOS_SEP_S "%s", to, name);
+        ok = copy_tree(a, b);
     }
+    fs_dir_close(&dir);
     return ok;
 }
 static void delete_tree(const char *p) {
-    if (!is_dir(p)) {
-        DeleteFileA(p);
-        return;
-    }
-    char pattern[MAX_PATH];
-    snprintf(pattern, sizeof pattern, "%s" HOS_SEP_S "*", p);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
-            char a[MAX_PATH];
-            snprintf(a, sizeof a, "%s" HOS_SEP_S "%s", p, fd.cFileName);
+    if (!is_dir(p)) { fs_unlink(p); return; }
+    FsDir dir;
+    if (fs_dir_open(&dir, p)) {
+        int directory;
+        uint64_t size;
+        char name[HOS_PATH_MAX];
+        while (fs_dir_next(&dir, name, sizeof name, &directory, &size)) {
+            if (!strcmp(name, ".") || !strcmp(name, "..")) continue;
+            char a[HOS_PATH_MAX];
+            snprintf(a, sizeof a, "%s" HOS_SEP_S "%s", p, name);
             delete_tree(a);
-        } while (FindNextFileA(h, &fd));
-        FindClose(h);
+        }
+        fs_dir_close(&dir);
     }
-    RemoveDirectoryA(p);
+    fs_rmdir(p);
 }
+
 static const char *saves_dir(const char *beside) {
-    static char dir[MAX_PATH];
+    static char dir[HOS_PATH_MAX];
 #if defined(_WIN32) && !defined(__EMSCRIPTEN__)
-    char docs[MAX_PATH];
+    char docs[HOS_PATH_MAX];
     if (FAILED(SHGetFolderPathA(NULL, CSIDL_PERSONAL | CSIDL_FLAG_CREATE, NULL, SHGFP_TYPE_CURRENT, docs))) return beside;
     snprintf(dir, sizeof dir, "%s\\My Games", docs);
-    CreateDirectoryA(dir, NULL);
+    fs_mkdir(dir);
     snprintf(dir, sizeof dir, "%s\\My Games\\Hookshot", docs);
 #elif defined(__EMSCRIPTEN__)
     return beside;
@@ -217,38 +214,37 @@ static const char *saves_dir(const char *beside) {
     if (xdg && xdg[0] == '/') snprintf(dir, sizeof dir, "%s", xdg);
     else if (home && home[0] == '/') {
         snprintf(dir, sizeof dir, "%s/.local", home);
-        CreateDirectoryA(dir, NULL);
+        fs_mkdir(dir);
         snprintf(dir, sizeof dir, "%s/.local/share", home);
     } else return beside;
-    CreateDirectoryA(dir, NULL);
+    fs_mkdir(dir);
     snprintf(dir + strlen(dir), sizeof dir - strlen(dir), "/hookshot");
 #endif
-    CreateDirectoryA(dir, NULL);
-    if (GetFileAttributesA(dir) == INVALID_FILE_ATTRIBUTES) return beside;
-    char pattern[MAX_PATH];
-    snprintf(pattern, sizeof pattern, "%s" HOS_SEP_S "*", beside);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return dir;   /* (no saves of before) */
-    int moved = 0, kept = 0;
-    do {
-        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
-        char from[MAX_PATH], to[MAX_PATH];
-        snprintf(from, sizeof from, "%s" HOS_SEP_S "%s", beside, fd.cFileName);
-        snprintf(to, sizeof to, "%s" HOS_SEP_S "%s", dir, fd.cFileName);
-        if (GetFileAttributesA(to) != INVALID_FILE_ATTRIBUTES) kept++;   /* (never over one there: that one is newer) */
-        else if (MoveFileExA(from, to, 0)) moved++;
+    fs_mkdir(dir);
+    if (!is_dir(dir)) return beside;
+    FsDir entries;
+    if (!fs_dir_open(&entries, beside)) return dir;   /* no previous saves */
+    int moved = 0, kept = 0, directory;
+    uint64_t size;
+    char name[HOS_PATH_MAX];
+    while (fs_dir_next(&entries, name, sizeof name, &directory, &size)) {
+        if (!strcmp(name, ".") || !strcmp(name, "..")) continue;
+        char from[HOS_PATH_MAX], to[HOS_PATH_MAX];
+        snprintf(from, sizeof from, "%s" HOS_SEP_S "%s", beside, name);
+        snprintf(to, sizeof to, "%s" HOS_SEP_S "%s", dir, name);
+        if (fs_type(to) != -1) kept++;   /* never replace the newer destination */
+        else if (fs_move_new(from, to)) moved++;
         else if (copy_tree(from, to)) delete_tree(from), moved++;
-        else delete_tree(to), kept++;   /* (a copy cut short: the original stays whole) */
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+        else delete_tree(to), kept++;   /* incomplete copy: retain the original */
+    }
+    fs_dir_close(&entries);
     if (kept) {   /* (another disk, or both places hold the same save: nothing is lost, the old place stays) */
         hos_log("saves: %d of %s's entries could not go to %s: the saves stay in %s", kept, beside, dir, beside);
         return beside;
     }
-    RemoveDirectoryA(beside);
+    fs_rmdir(beside);
     if (moved) {
-        char note[MAX_PATH];
+        char note[HOS_PATH_MAX];
         const char *sep = strrchr(beside, HOS_SEP);
         snprintf(note, sizeof note, "%.*s" HOS_SEP_S "saves-moved.txt", sep ? (int)(sep - beside) : 0, beside);
         FILE *f = fopen(note, "w");
@@ -266,8 +262,8 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     {   // (hookshot_env.txt beside the game: NAME=VALUE lines set as environment variables before anything reads them, for the switches
         // players are asked to test. Lines starting with # are notes)
-        char path[MAX_PATH + 32];
-        DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+        char path[HOS_PATH_MAX + 32];
+        size_t n = hos_executable_path(path, HOS_PATH_MAX);
         while (n && path[n - 1] != 92 && path[n - 1] != 47) n--;
         memcpy(path + n, "hookshot_env.txt", 17);
         FILE *f = fopen(path, "r");
@@ -294,8 +290,8 @@ int main(int argc, char **argv) {
     {   // (started from its icon the game has nowhere to log to: hookshot_log.txt beside it, last run only, for players to send in)
         HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
         if (!err || err == INVALID_HANDLE_VALUE || GetFileType(err) == FILE_TYPE_UNKNOWN) {
-            char path[MAX_PATH + 32];
-            DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+            char path[HOS_PATH_MAX + 32];
+            size_t n = hos_executable_path(path, HOS_PATH_MAX);
             while (n && path[n - 1] != 92 && path[n - 1] != 47) n--;
             memcpy(path + n, "hookshot_log.txt", 17);
             if (freopen(path, "w", stderr)) setvbuf(stderr, NULL, _IONBF, 0);
@@ -323,18 +319,22 @@ int main(int argc, char **argv) {
         }
         else if (!image) image = argv[i];
     }
-    static char beside_image[MAX_PATH], beside_romfs[MAX_PATH], beside_user[MAX_PATH];
+    static char beside_image[HOS_PATH_MAX], beside_romfs[HOS_PATH_MAX], beside_user[HOS_PATH_MAX];
     if (!image) {   /* (hookshot) started with nothing, as a game is: everything beside the executable (the builder's folder) */
-        char dir[MAX_PATH];
-        const DWORD len = GetModuleFileNameA(NULL, dir, MAX_PATH);
+        char dir[HOS_PATH_MAX];
+        const size_t len = hos_executable_path(dir, sizeof dir);
         char *slash = len ? strrchr(dir, HOS_SEP) : NULL;
         if (slash) {
             *slash = 0;
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)
             SetCurrentDirectoryA(dir);
-            snprintf(beside_image, MAX_PATH, "%s" HOS_SEP_S "image.bin", dir);
-            snprintf(beside_romfs, MAX_PATH, "%s" HOS_SEP_S "romfs", dir);
-            snprintf(beside_user, MAX_PATH, "%s" HOS_SEP_S "user", dir);
-            if (GetFileAttributesA(beside_image) != INVALID_FILE_ATTRIBUTES) {
+#else
+            chdir(dir);
+#endif
+            snprintf(beside_image, HOS_PATH_MAX, "%s" HOS_SEP_S "image.bin", dir);
+            snprintf(beside_romfs, HOS_PATH_MAX, "%s" HOS_SEP_S "romfs", dir);
+            snprintf(beside_user, HOS_PATH_MAX, "%s" HOS_SEP_S "user", dir);
+            if (fs_type(beside_image) != -1) {
                 image = beside_image;
                 if (!hos_romfs_dir) hos_romfs_dir = beside_romfs;
                 if (!hos_user_dir) hos_user_dir = saves_dir(beside_user);
@@ -347,7 +347,7 @@ int main(int argc, char **argv) {
     }
     if (getenv("HOS_TRACE")) hos_trace = 1;
     if (!hos_user_dir) hos_user_dir = "user";
-    CreateDirectoryA(hos_user_dir, NULL);
+    fs_mkdir(hos_user_dir);
     if (!reserve_guest()) {
         fprintf(stderr, "cannot reserve the guest window\n");
         return 1;
@@ -370,7 +370,11 @@ int main(int argc, char **argv) {
     /* exactly the file's size: a read into "the rest of the guest window" (~4 GB) made Windows commit physical memory
        for ~2 GB of it before the game ran (the whole heap was resident from the start, ~1.3 GB of it never used) */
     fseek(f, 0, SEEK_END);
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)
     const long long file_size = _ftelli64(f);
+#else
+    const long long file_size = ftello(f);
+#endif
     fseek(f, 0, SEEK_SET);
     if (file_size > 0) hos_commit(IMAGE_BASE, (uint64_t)file_size);
     size_t n = file_size > 0 && (uint64_t)file_size <= GUEST_SPACE - IMAGE_BASE
@@ -392,11 +396,11 @@ int main(int argc, char **argv) {
         memcpy(&was, at, 4);
         if (!e) {   /* (the Insert menu's Ultrawide, off unless it says 1: the main monitor's shape) */
             int on = 0;
-            char path[MAX_PATH];
-            const DWORD len = GetModuleFileNameA(NULL, path, MAX_PATH);
+            char path[HOS_PATH_MAX];
+            const size_t len = hos_executable_path(path, sizeof path);
             char *slash = len ? strrchr(path, HOS_SEP) : NULL;
             if (slash) {
-                snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "hookshot_options.ini");
+                snprintf(slash + 1, (size_t)(path + HOS_PATH_MAX - slash - 1), "hookshot_options.ini");
                 FILE *o = fopen(path, "r");
                 if (o) {
                     char line[80];
@@ -405,7 +409,12 @@ int main(int argc, char **argv) {
                     fclose(o);
                 }
             }
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)
             const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+#else
+            int sw = 0, sh = 0;
+            hos_linux_screen_size(&sw, &sh);
+#endif
             if (on && sh > 0 && (float)sw / (float)sh > 1.8f) want = (float)sw / (float)sh;
         }
         if (want > 1.0f && was > 1.777f && was < 1.778f) {

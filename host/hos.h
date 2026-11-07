@@ -109,6 +109,7 @@ HosThread *hos_thread_create(uint64_t guest_tt, uint64_t entry, uint64_t arg, ui
 void hos_thread_start(HosThread *t);
 void hos_thread_join(HosThread *t);
 void hos_thread_destroy(HosThread *t);
+__attribute__((noreturn)) void hos_thread_exit(void);
 void hos_thread_set_name(HosThread *t, const char *name);
 void hos_thread_pin(void *h, const char *name);   /* HOS_PIN: host CPU affinity by thread name */
 int hos_game_cores(void);   /* totk_cores.c: HOS_GAME_CORES, or 0 */
@@ -125,7 +126,7 @@ int hos_vcore_away(void);
 void hos_vcore_back(void);
 void hos_vcore_checkpoint(void);
 void hos_vcore_yield(void);
-int hos_cv_sleep(void *cv, void *srw_lock, unsigned ms);   /* SleepConditionVariableSRW (exclusive) for guest threads */
+int hos_cv_sleep(void *cv, void *mutex, unsigned ms);   /* host monitor wait, releasing virtual core ownership */
 void hos_thread_boost(int level);
 void hos_thread_stack(HosThread *t, uint64_t *addr, uint64_t *size);
 uint64_t *hos_tls_slots(HosThread *t);                     /* nn::os TLS slot values */

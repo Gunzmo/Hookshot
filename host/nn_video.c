@@ -14,8 +14,7 @@
 #include "hos.h"
 #include <stdlib.h>
 #include <string.h>
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "hos_sync.h"
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
 
@@ -70,7 +69,7 @@ typedef struct {
     int eos;                         /* the last submission is in and decoded: an empty queue is the end */
     Pending *phead, *ptail;          /* submissions not decoded yet, oldest first */
     int64_t submits, acquires;
-    SRWLOCK lock;
+    HosMutex lock;
 } Dec;
 
 static void *host_of(uint64_t obj, uint32_t magic) {
@@ -133,8 +132,8 @@ HLE(_ZN2nn5codec26ReadDecoderOutputImageRgbaEPKNS0_25VideoDecoderImagePoolTypeEj
     const uint32_t i = (uint32_t)ARG(1), x = (uint16_t)ARG(2), y = (uint16_t)ARG(3), w = (uint16_t)ARG(4), h = (uint16_t)ARG(5);
     const uint64_t dst = ARG(6), stride = ARG(7) ? ARG(7) : (uint64_t)w * 4;
     {   /* (hookshot, HOS_VIDEO_LOG) the first reads, with where they go */
-        static volatile LONG n;
-        if (video_log() && InterlockedIncrement(&n) <= 4)
+        static volatile int32_t n;
+        if (video_log() && __atomic_add_fetch(&n, 1, __ATOMIC_SEQ_CST) <= 4)
             hos_log("video: ReadDecoderOutputImageRgba(pool %s, index %u, %u,%u %ux%u, dst %#llx stride %llu)",
                     o ? "ok" : "unknown", i, x, y, w, h, (unsigned long long)dst, (unsigned long long)stride);
     }
@@ -155,11 +154,11 @@ HLE(_ZN2nn5codec26ReadDecoderOutputImageNv12EPKNS0_25VideoDecoderImagePoolTypeEj
     const uint64_t uvdst = G64(c->x[31] + 8), uvstride = G64(c->x[31] + 16) ? G64(c->x[31] + 16) : w;
     {   /* (HOS_VIDEO_LOG) each new destination, with the pool and image */
         static uint64_t seen[32];
-        static volatile LONG nseen;
+        static volatile int32_t nseen;
         int k;
         for (k = 0; k < nseen && seen[k] != ydst; k++) {}
         if (video_log() && k == nseen && nseen < 32) {
-            seen[InterlockedIncrement(&nseen) - 1] = ydst;
+            seen[__atomic_add_fetch(&nseen, 1, __ATOMIC_SEQ_CST) - 1] = ydst;
             hos_log("video: ReadDecoderOutputImageNv12(pool %#llx %s, index %u, %u,%u %ux%u, y %#llx/%llu, uv %#llx/%llu) "
                     "lr %#llx", (unsigned long long)ARG(0), o ? "ok" : "unknown", i, x, y, w, h, (unsigned long long)ydst,
                     (unsigned long long)ystride, (unsigned long long)uvdst, (unsigned long long)uvstride,
@@ -190,7 +189,7 @@ static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, i
 #endif
     if (!codec) codec = avcodec_find_decoder(id);
     Dec *d = (Dec *)calloc(1, sizeof *d);
-    InitializeSRWLock(&d->lock);
+    hos_mutex_init(&d->lock);
     if (codec) {
         d->ctx = avcodec_alloc_context3(codec);
         d->ctx->thread_count = id == AV_CODEC_ID_AV1 ? 4 : 2;   /* (1080p AV1 in software: more than two to keep up) */
@@ -229,6 +228,7 @@ static void dec_finalize(Ctx *c) {
     mf_av1_close(d->mf);
     av_packet_free(&d->pkt);
     av_frame_free(&d->frame);
+    hos_mutex_destroy(&d->lock);
     free(d);
     set_host(ARG(0), DEC_MAGIC, NULL);
 }
@@ -325,12 +325,12 @@ static void pending_push(Dec *d, AVPacket *pkt) {
 }
 /* SubmitXDecoderInputBuffer(u64* id, decoder, data, size, TimeSpan pts, bool last): kept, decoded when a picture is
    acquired (the library submits a whole movie at once: its pictures decoded then would not fit any queue) */
-static volatile LONG64 submissions;
+static volatile int64_t submissions;
 static void dec_submit(Ctx *c) {
     Dec *d = (Dec *)host_of(ARG(1), DEC_MAGIC);
-    if (ARG(0)) G64(ARG(0)) = (uint64_t)InterlockedIncrement64(&submissions);
+    if (ARG(0)) G64(ARG(0)) = (uint64_t)__atomic_add_fetch(&submissions, 1, __ATOMIC_SEQ_CST);
     if (!d || (!d->ctx && !d->mf)) { RET(0); return; }
-    AcquireSRWLockExclusive(&d->lock);
+    hos_mutex_lock(&d->lock);
     if (ARG(2) && ARG(3)) {
         AVPacket *pkt = av_packet_alloc();
         if (pkt && av_new_packet(pkt, (int)ARG(3)) == 0) {
@@ -346,13 +346,13 @@ static void dec_submit(Ctx *c) {
     if (video_log() && (d->submits <= 8 || (ARG(5) & 1)))
         hos_log("video: submit %lld (%llu bytes, pts %lld%s)", (long long)d->submits, (unsigned long long)ARG(3),
                 (long long)ARG(4), (ARG(5) & 1) ? ", last" : "");
-    ReleaseSRWLockExclusive(&d->lock);
+    hos_mutex_unlock(&d->lock);
     RET(0);
 }
 static void dec_flush(Ctx *c) {
     Dec *d = (Dec *)host_of(ARG(0), DEC_MAGIC);
     if (d && (d->ctx || d->mf)) {
-        AcquireSRWLockExclusive(&d->lock);
+        hos_mutex_lock(&d->lock);
         if (d->ctx) avcodec_flush_buffers(d->ctx);
         else mf_av1_flush(d->mf);
         pending_free(d);
@@ -360,7 +360,7 @@ static void dec_flush(Ctx *c) {
         d->qhead = d->qn = 0;
         d->eos = 0;
         for (int i = 0; i < MAX_SLOTS; i++) d->slot_last[i] = 0;
-        ReleaseSRWLockExclusive(&d->lock);
+        hos_mutex_unlock(&d->lock);
     }
     RET(0);
 }
@@ -382,19 +382,19 @@ static void dec_acquire(Ctx *c) {
     if (!d) { RET(RESULT_NO_OUTPUT); return; }
     /* (the library aborts on any failure here: the hardware call waits for a picture. Up to ~100 ms for one decoded
        by another thread's submission; then a free buffer as it was, so the caller is never refused) */
-    AcquireSRWLockExclusive(&d->lock);
+    hos_mutex_lock(&d->lock);
     decode_pending(d);
     for (int tries = 0; !d->qn && !d->eos && tries < 50; tries++) {
-        ReleaseSRWLockExclusive(&d->lock);
+        hos_mutex_unlock(&d->lock);
         hos_sleep_ns(2000000);
-        AcquireSRWLockExclusive(&d->lock);
+        hos_mutex_lock(&d->lock);
         decode_pending(d);
     }
     int slot = -1;
     for (int i = 0; i < MAX_SLOTS && slot < 0; i++)
         if (d->slots[i] && !d->busy[i] && host_of(d->slots[i], POOL_MAGIC)) slot = i;
     if (slot < 0) {
-        ReleaseSRWLockExclusive(&d->lock);
+        hos_mutex_unlock(&d->lock);
         RET(RESULT_NO_OUTPUT);
         return;
     }
@@ -404,7 +404,7 @@ static void dec_acquire(Ctx *c) {
         if (d->eos) d->slot_last[slot] = 1;
         if (video_log()) hos_log("video: acquire %lld: nothing decoded%s, buffer %d again", (long long)d->acquires,
                                  d->eos ? " (the end)" : "", slot);
-        ReleaseSRWLockExclusive(&d->lock);
+        hos_mutex_unlock(&d->lock);
         if (ARG(0)) G32(ARG(0)) = (uint32_t)slot;
         RET(0);
         return;
@@ -450,7 +450,7 @@ static void dec_acquire(Ctx *c) {
     }
     picture_free(p);
     d->qhead = (d->qhead + 1) % MAX_QUEUE, d->qn--;
-    ReleaseSRWLockExclusive(&d->lock);
+    hos_mutex_unlock(&d->lock);
     if (ARG(0)) G32(ARG(0)) = (uint32_t)slot;
     RET(0);
 }
@@ -497,7 +497,7 @@ HLE(_ZN2nn5codec15FlushVp9DecoderEPNS0_14Vp9DecoderTypeE) { dec_flush(c); }
 HLE(_ZN2nn5codec33GetVp9DecoderSubmissionReadyEventEPNS0_14Vp9DecoderTypeE) { RET(ready_event()); }
 HLE(_ZN2nn5codec27SubmitVp9DecoderInputBufferEPmPNS0_14Vp9DecoderTypeEPKvmNS_8TimeSpanEb) { dec_submit(c); }
 HLE(_ZN2nn5codec36SubmitEncryptedVp9DecoderInputBufferEPmPNS0_14Vp9DecoderTypeEPKNS0_18EncryptionPropertyEPKvmNS_8TimeSpanEb) {
-    if (ARG(0)) G64(ARG(0)) = (uint64_t)InterlockedIncrement64(&submissions);
+    if (ARG(0)) G64(ARG(0)) = (uint64_t)__atomic_add_fetch(&submissions, 1, __ATOMIC_SEQ_CST);
     RET(0);
 }
 HLE(_ZN2nn5codec29AcquireVp9DecoderOutputBufferEPjPNS_2gs16NativeSyncHandleEPNS0_14Vp9DecoderTypeE) { dec_acquire(c); }

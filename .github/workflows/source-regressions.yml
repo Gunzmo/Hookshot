@@ -4,9 +4,8 @@ on:
   push:
     branches: [main]
     paths:
-      - host/hos.h
-      - host/nn_fs.c
-      - host/fs_platform.h
+      - host/**
+      - tests/test_host*
       - nx2/kit.py
       - nx2/rtgen.py
       - third_party/a64-kit/rt/a64.h
@@ -21,9 +20,8 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - host/hos.h
-      - host/nn_fs.c
-      - host/fs_platform.h
+      - host/**
+      - tests/test_host*
       - nx2/kit.py
       - nx2/rtgen.py
       - third_party/a64-kit/rt/a64.h
@@ -69,3 +67,6 @@ jobs:
       - name: Check Linux guest filesystem
         if: runner.os == 'Linux'
         run: python -I -B tests/test_nn_fs_linux.py
+      - name: Check native Linux host services
+        if: runner.os == 'Linux'
+        run: python -I -B tests/test_host_linux.py --core-only

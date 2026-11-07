@@ -2,6 +2,7 @@
    commit (TOTK commits its whole 4 GB window up front; MKW's 512 GB window is only reserved), and stand-ins for the
    hooks of files not taken into host/ (the renderer and display, the profiler, mods, TOTK's own patches). */
 #include "hos.h"
+#include "hos_platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
@@ -9,6 +10,7 @@
 #ifndef _WIN32
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <pthread.h>
 #endif
 
 /* ---- the guest window ---------------------------------------------------------------------------------------
@@ -158,15 +160,14 @@ void hos_backtrace(void) {
 
 /* HOS_STATS_AFTER=<seconds> (with HOS_HOSTCALL_STATS=1): the host call counts and the last calls at that time, for
    runs that are stopped rather than exit (what a quiet game is doing) */
-static DWORD WINAPI stats_after(void *p) {
-    Sleep((DWORD)(uintptr_t)p * 1000);
+static void stats_after(void *p) {
+    hos_sleep_ns((int64_t)(uintptr_t)p * 1000000000);
     void hos_hostcall_stats(void);
     hos_log("stats: after %u s", (unsigned)(uintptr_t)p);
     void hos_thread_dump(void);
     hos_thread_dump();
     hos_log_flush();
     hos_hostcall_stats();
-    return 0;
 }
 
 /* heap corruption and fail-fast reports go to the process's end without reaching the unhandled filter: reported here
@@ -182,7 +183,7 @@ void hos_commit_init(void) {
     AddVectoredExceptionHandler(0, report_fatal);
     SetUnhandledExceptionFilter(report_crash);
     const char *after = getenv("HOS_STATS_AFTER");
-    if (after && atoi(after) > 0) CreateThread(NULL, 0, stats_after, (void *)(uintptr_t)atoi(after), 0, NULL);
+    if (after && atoi(after) > 0) hos_start_worker(stats_after, (void *)(uintptr_t)atoi(after));
 }
 
 /* ---- stand-ins --------------------------------------------------------------------------------------------- */
@@ -647,7 +648,16 @@ void a64_poll(Ctx *c) {
 
 /* CNTPCT_EL0 at the Switch 2's 31.25 MHz (rt/a64_rt.c's default counts the Switch 1's 19.2 MHz). The SDK checks
    nn::os::GetSystemTickFrequency against 31250000 at init and aborts otherwise. */
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+static int64_t native_tick_base;
+static void native_tick_init(void) { native_tick_base = hos_now_ns(); }
+#endif
 uint64_t a64_cntpct_host(void) {
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, native_tick_init);
+    return (uint64_t)(hos_now_ns() - native_tick_base) / 32;
+#else
     static LARGE_INTEGER base;
     static uint64_t mult;
     LARGE_INTEGER now;
@@ -660,6 +670,7 @@ uint64_t a64_cntpct_host(void) {
     }
     QueryPerformanceCounter(&now);
     return (uint64_t)(((unsigned __int128)(uint64_t)(now.QuadPart - base.QuadPart) * mult) >> 32);
+#endif
 }
 
 /* ---- what the renderer (gpu/render, TOTKPort's) asks of TOTKPort's hos_prof.c and totk_ultrawide.c ---- */
@@ -709,8 +720,14 @@ void hos_memory_map_log(void) {
 void hos_ultrawide_apply(void) {}                 /* (totk_ultrawide.c) */
 float hos_view_aspect;                            /* (totk_ultrawide.c: 0, the game's own 16:9) */
 void hos_host_thread_register_self(const char *name) {   /* (hos_prof.c: names for its stats; here the thread's description) */
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    char short_name[16];
+    snprintf(short_name, sizeof short_name, "%.15s", name);
+    pthread_setname_np(pthread_self(), short_name);
+#else
     wchar_t w[64];
     if (MultiByteToWideChar(CP_UTF8, 0, name, -1, w, 64)) SetThreadDescription(GetCurrentThread(), w);
+#endif
 }
 void hos_process_memory(uint64_t *private_bytes, uint64_t *working_set) {
 #ifndef _WIN32   /* (hookshot) Linux: /proc/self/status's anonymous and resident memory */
