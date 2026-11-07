@@ -182,6 +182,16 @@ static void display_main(void *p) {
             SDL_VERSIONNUM_MICRO(SDL_GetVersion()), SDL_GetCurrentVideoDriver());
     fullscreen_event = SDL_RegisterEvents(1);   /* (0 when none is left) */
     surface_desc.native = window;
+    SDL_PropertiesID props = SDL_GetWindowProperties(window);
+    surface_desc.display = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, NULL);
+    if (surface_desc.display) {
+        surface_desc.backend = 1;
+        surface_desc.window = (uintptr_t)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, NULL);
+    } else {
+        surface_desc.backend = 2;
+        surface_desc.display = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, NULL);
+        surface_desc.window = SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
+    }
     renderer = rx_start(&surface_desc);
     if (!renderer) hos_log("display: no Vulkan renderer: the window stays black");
     renderer_signal();

@@ -125,6 +125,9 @@ typedef struct HosLinuxWindow {
     void (*size)(void *native, int *width, int *height);
     void (*set_fullscreen)(void *native, int on);   /* (the Insert menu's Fullscreen row; done on the window's thread) */
     int (*fullscreen)(void *native);                /* (F11 included) */
+    int backend; /* 1: Wayland, 2: X11 */
+    void *display;
+    uint64_t window;
 } HosLinuxWindow;
 
 /* the DLL's one export: null when Vulkan is not usable (the executable then falls back to WebGPU) */

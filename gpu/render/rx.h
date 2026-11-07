@@ -11,7 +11,7 @@
 extern "C" {
 #endif
 
-/* The window to present into (a Windows HWND), from the window's thread once it exists; null: no window (the
+/* The window to present into (Windows HWND; Linux HosLinuxWindow descriptor), from the window's thread once it exists; null: no window (the
    renderer draws offscreen). Returns 1 when the renderer runs, 0 when the window should show frames itself. */
 int rx_start(void *hwnd);
 int rx_active(void);

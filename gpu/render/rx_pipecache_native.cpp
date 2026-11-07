@@ -27,9 +27,10 @@
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#include <windows.h>
+#include "rx_platform.h"
 
 #include "rx_internal.h"
+#include <filesystem>
 
 namespace rx {
 namespace {
@@ -61,13 +62,17 @@ struct Reader {
 };
 
 std::string path_of_cache() {
-    char exe[MAX_PATH];
+    char exe[4096];
+#ifdef _WIN32
     DWORD n = GetModuleFileNameA(nullptr, exe, sizeof exe);
+#else
+    size_t n = hos_executable_path(exe,sizeof exe);
+#endif
     while (n && exe[n - 1] != '\\' && exe[n - 1] != '/') n--;
     exe[n] = 0;
     std::string dir = std::string(exe) + "rxcache";
-    CreateDirectoryA(dir.c_str(), nullptr);
-    return dir + "\\pipelines.bin";
+    rx_platform::directory(dir.c_str());
+    return (std::filesystem::path(dir) / "pipelines.bin").string();
 }
 
 bool nc_on = true;
@@ -478,6 +483,7 @@ void native_cache_step() {
 
 #else
 #include "rx_internal.h"
+#include <filesystem>
 namespace rx {
 bool native_cache_on() { return false; }
 void native_cache_start() {}

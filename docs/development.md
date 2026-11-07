@@ -62,7 +62,31 @@ save migration, including destination collisions and copies between filesystems 
 
 <!-- /coderabbit-ai-generated:v1 -->
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:1ae4f96ef9c777d7a51f6f2900330f6a1fbde134f30571371d7e7434cd5722b1 -->
+
+### Native Linux WebGPU renderer
+
+The optional WebGPU renderer uses native Linux memory allocation and page discard, recursive locking, cache files,
+and RenderDoc lookup. SDL provides Wayland or X11 handles for WebGPU surfaces. Guest writes use the existing
+software write tracking; when it is disabled, the renderer conservatively uploads buffers on each draw. GPU
+readback preserves software dirty marks. Windows keeps its native surface and write-watch implementations.
+
+Point `WGPU_NATIVE` at a wgpu-native distribution containing `include/webgpu/` and `lib/libwgpu_native.so`, then
+build with the normal Linux runtime command. Native platform tests need no WebGPU distribution. The optional
+runtime check links the built renderer objects into a temporary device-initialization harness and uses a software
+Vulkan adapter when available:
+
+```sh
+python -I -B tests/test_webgpu_linux.py
+WGPU_NATIVE=/path/to/wgpu-native python -I nx2/build.py --part runtime --target linux
+python -I -B tests/test_webgpu_linux.py --runtime work/runtime-linux
+```
+
 ### Dependencies and release folders
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 `scripts/fetch-deps.sh [linux|windows|all]` fetches what the repository does not hold, at pinned versions with their
 sha256: the Vulkan and SPIR-V headers and VMA (`RX_CPM=work/deps/cpm`), FFmpeg's LGPL shared builds, SDL3 (Windows'

@@ -551,7 +551,7 @@ def main():
                            (["-Wl,/nodefaultlib:clang_rt.profile.lib"] if PGO == "gen" and win else []) +
                            ([os.path.join(kit.WORK, "hookshot.res")] if win and os.path.exists(os.path.join(kit.WORK, "hookshot.res")) else []) +   # (nx2/make_icon.py)
                            (["-Wl,/subsystem:windows,/entry:mainCRTStartup"] if win and os.environ.get("RX_RELEASE") == "1" else []) +   # (no console window)
-                           ([wgpu_lib] + ([] if win else ["-Wl,-rpath,$ORIGIN"]) if wgpu else []) +
+                           ([wgpu_lib] + ([] if win else ["-lstdc++", "-Wl,-rpath,$ORIGIN"]) if wgpu else []) +
                            ffmpeg_libs() +
                            (module.runtime_link_args(out, [o for o in objs if "host_" in os.path.basename(o)], rt_objs, cc)
                             if a.part == "runtime" else []),

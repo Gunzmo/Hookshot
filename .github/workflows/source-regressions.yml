@@ -7,7 +7,8 @@ on:
       - host/**
       - tests/test_host*
       - tests/test_fault_linux.c
-      - gpu/vk/**
+      - gpu/**
+      - tests/test_webgpu*
       - nx2/build.py
       - nx2/target.py
       - nx2/kit.py
@@ -27,7 +28,8 @@ on:
       - host/**
       - tests/test_host*
       - tests/test_fault_linux.c
-      - gpu/vk/**
+      - gpu/**
+      - tests/test_webgpu*
       - nx2/build.py
       - nx2/target.py
       - nx2/kit.py
@@ -78,3 +80,7 @@ jobs:
       - name: Check native Linux host services
         if: runner.os == 'Linux'
         run: python -I -B tests/test_host_linux.py --core-only
+
+      - name: Check native Linux WebGPU platform services
+        if: runner.os == 'Linux'
+        run: python -I -B tests/test_webgpu_linux.py

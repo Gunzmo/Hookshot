@@ -12,10 +12,11 @@
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#include <windows.h>
+#include "rx_platform.h"
 
 #include "renderdoc_app.h"
 #include "rx_internal.h"
+#include <filesystem>
 
 namespace rx {
 namespace {
@@ -589,11 +590,11 @@ void dump_frame_images(const char* dir) {
     if (!frame_dump_active()) return;
     if (pass_open) hos_log("rx-frame:   %d draws", pass_draws);
     pass_open = false;
-    CreateDirectoryA(dir, nullptr);
+    rx_platform::directory(dir);
     char sub[512];
     if (getenv("RX_DUMP_COUNT")) {
         std::snprintf(sub, sizeof sub, "%s/%lld", dir, (long long)frame_number);
-        CreateDirectoryA(sub, nullptr);
+        rx_platform::directory(sub);
         dir = sub;
         hos_log("rx-frame: end of frame %lld", (long long)frame_number);
     }
@@ -625,10 +626,10 @@ void dump_frame_images(const char* dir) {
         std::snprintf(from, sizeof from, "%s/%03d_%08llx_%ux%u_%x.png", dir, 900 + order - 1, (unsigned long long)t.guest,
                       t.width, t.height, (unsigned)t.format);
         std::snprintf(to, sizeof to, "%s/%s.png", dir, label.c_str());
-        MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING);
+        rx_platform::replace(from, to);
         std::strcpy(from + std::strlen(from) - 4, ".raw");   // (and the raw texels, when the format has them)
         std::snprintf(to, sizeof to, "%s/%s.raw", dir, label.c_str());
-        MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING);
+        rx_platform::replace(from, to);
         wgpuTextureRelease(t.tex);
     }
     snapshots.clear();
@@ -685,9 +686,18 @@ void rdoc_present() {}
 RENDERDOC_API_1_1_2* rdoc_api() {
     static RENDERDOC_API_1_1_2* const api = [] {
         RENDERDOC_API_1_1_2* a = nullptr;
+#ifdef _WIN32
         if (HMODULE m = GetModuleHandleA("renderdoc.dll"))
             if (auto get = reinterpret_cast<pRENDERDOC_GetAPI>(GetProcAddress(m, "RENDERDOC_GetAPI")))
                 if (!get(eRENDERDOC_API_Version_1_1_2, reinterpret_cast<void**>(&a))) a = nullptr;
+#else
+        // Only attach to RenderDoc when it was already injected.
+        if (void *m = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD)) {
+            if (auto get = reinterpret_cast<pRENDERDOC_GetAPI>(dlsym(m,"RENDERDOC_GetAPI")))
+                if (!get(eRENDERDOC_API_Version_1_1_2,reinterpret_cast<void**>(&a))) a=nullptr;
+            // Retain the library while the cached API is in use.
+        }
+#endif
         if (a && getenv("RX_RDOC_FILE")) a->SetCaptureFilePathTemplate(getenv("RX_RDOC_FILE"));
         return a;
     }();

@@ -385,9 +385,13 @@ extern Device dev;
 /// The renderer's lock: recursive, over a Windows SRW lock (std::recursive_mutex was ~3.5% of the GPU thread: it is
 /// taken for every renderer method, several a draw, nearly always by the GPU thread itself).
 class RecursiveLock {
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    std::recursive_mutex native_;
+#else
     alignas(8) unsigned char srw_[64] = {};   // an SRWLOCK (SRWLOCK_INIT is all zero; the web's is a pthread rwlock)
     std::atomic<unsigned long> owner_{0};
     unsigned depth_ = 0;
+#endif
 public:
     void lock();
     void unlock();

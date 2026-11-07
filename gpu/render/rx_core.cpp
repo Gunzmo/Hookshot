@@ -1,6 +1,6 @@
 // The renderer's core: the WebGPU device and the window's surface, batches (one command encoder and its upload
 // memory per GPU submission), render targets, clears, the 3D engine's draw methods (suyu's DrawManager), present.
-#include <intrin.h>
+
 #include <algorithm>
 #include <cmath>
 #include <atomic>
@@ -16,9 +16,11 @@
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#include <windows.h>
+#include "rx_platform.h"
 
 #include "rx_internal.h"
+#include "../vk/vk_api.h"
+#include <chrono>
 #include "video_core/textures/decoders.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -61,13 +63,16 @@ void wait_step() {
 #ifdef __EMSCRIPTEN__
     emscripten_sleep(1);
 #else
-    Sleep(1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
 #endif
 }
 
 Device dev;
 RecursiveLock mu;
 void RecursiveLock::lock() {
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    native_.lock();
+#else
     const unsigned long me = GetCurrentThreadId();
     if (owner_.load(std::memory_order_relaxed) == me) {
         depth_++;
@@ -76,11 +81,16 @@ void RecursiveLock::lock() {
     AcquireSRWLockExclusive(reinterpret_cast<PSRWLOCK>(&srw_));
     owner_.store(me, std::memory_order_relaxed);
     depth_ = 1;
+#endif
 }
 void RecursiveLock::unlock() {
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    native_.unlock();
+#else
     if (--depth_) return;
     owner_.store(0, std::memory_order_relaxed);
     ReleaseSRWLockExclusive(reinterpret_cast<PSRWLOCK>(&srw_));
+#endif
 }
 int64_t frame_number;
 int64_t st_draws, st_skipped, st_pipelines, st_clears;
@@ -92,7 +102,7 @@ WGPUSurface surface;
 WGPUTextureFormat surface_format = WGPUTextureFormat_BGRA8Unorm;
 WGPUPresentMode present_mode = WGPUPresentMode_Fifo;
 uint32_t surface_w, surface_h;
-volatile LONG want_w, want_h;
+std::atomic<int32_t> want_w{0}, want_h{0};
 WGPURenderPipeline blit_pipeline;
 WGPUBindGroupLayout blit_layout;
 WGPUSampler blit_sampler;
@@ -254,16 +264,15 @@ uint8_t* take_stream_memory(uint64_t size) {
             }
         }
     }
-    return static_cast<uint8_t*>(VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    return static_cast<uint8_t*>(rx_platform::allocate(size));
 }
 void give_stream_memory(uint64_t size, uint8_t* m, uint64_t used) {
 #if !RX_WEB
     constexpr uint64_t keep = 16ull << 20;
     if (used > keep && size > keep) {
         const uint64_t end = std::min<uint64_t>(size, (used + 0xFFFF) & ~0xFFFFull);
-        if (VirtualFree(m + keep, end - keep, MEM_DECOMMIT) &&
-            !VirtualAlloc(m + keep, end - keep, MEM_COMMIT, PAGE_READWRITE)) {
-            VirtualFree(m, 0, MEM_RELEASE);
+        if (!rx_platform::reset(m + keep, end - keep)) {
+            rx_platform::release(m, size);
             return;
         }
     }
@@ -273,7 +282,7 @@ void give_stream_memory(uint64_t size, uint8_t* m, uint64_t used) {
     int same = 0;
     for (const auto& e : stream_pool) same += e.capacity == size;
     if (same >= 10) {
-        VirtualFree(m, 0, MEM_RELEASE);
+        rx_platform::release(m, size);
         return;
     }
 #endif
@@ -295,8 +304,8 @@ void reset_idle_stream_memory() {
             continue;
         }
         const uint64_t len = std::min<uint64_t>(e.capacity, keep);
-        if (VirtualFree(e.memory, len, MEM_DECOMMIT) && !VirtualAlloc(e.memory, len, MEM_COMMIT, PAGE_READWRITE)) {
-            VirtualFree(e.memory, 0, MEM_RELEASE);
+        if (!rx_platform::reset(e.memory, len)) {
+            rx_platform::release(e.memory, e.capacity);
             stream_pool.erase(stream_pool.begin() + (ptrdiff_t)i);
             continue;
         }
@@ -321,7 +330,7 @@ void create_stream(Stream& s, const char* name, uint64_t size, WGPUBufferUsage u
     s.name = name;
 }
 
-bool init_device(HWND hwnd) {
+bool init_device(void *hwnd) {
 #ifdef __EMSCRIPTEN__
     (void)hwnd;
     dev.instance = wgpuCreateInstance(nullptr);
@@ -336,15 +345,16 @@ bool init_device(HWND hwnd) {
         WGPUSurfaceDescriptor sd{};
         sd.nextInChain = &src.chain;
         surface = wgpuInstanceCreateSurface(dev.instance, &sd);
+
     }
 #else
     WGPUInstanceExtras extras{};
     extras.chain.sType = (WGPUSType)WGPUSType_InstanceExtras;
     const char* be = getenv("RX_BACKEND");
     extras.backends = !be                           ? WGPUInstanceBackend_Primary
-                      : !_stricmp(be, "vulkan")     ? WGPUInstanceBackend_Vulkan
-                      : !_stricmp(be, "dx12")       ? WGPUInstanceBackend_DX12
-                      : !_stricmp(be, "gl")         ? WGPUInstanceBackend_GL
+                      : !rx_platform::casecmp(be, "vulkan")     ? WGPUInstanceBackend_Vulkan
+                      : !rx_platform::casecmp(be, "dx12")       ? WGPUInstanceBackend_DX12
+                      : !rx_platform::casecmp(be, "gl")         ? WGPUInstanceBackend_GL
                                                     : WGPUInstanceBackend_Primary;
     if (getenv("RX_VALIDATION")) extras.flags = WGPUInstanceFlag_Validation | WGPUInstanceFlag_Debug;
     // RX_SHADER_NAMES=1: the debug flag alone (no validation layers): naga names SPIR-V variables after the WGSL ones,
@@ -355,11 +365,11 @@ bool init_device(HWND hwnd) {
     {
         const char* lv = getenv("RX_WGPU_LOG");
         const WGPULogLevel level = !lv                        ? WGPULogLevel_Warn
-                                   : !_stricmp(lv, "off")     ? WGPULogLevel_Off
-                                   : !_stricmp(lv, "error")   ? WGPULogLevel_Error
-                                   : !_stricmp(lv, "info")    ? WGPULogLevel_Info
-                                   : !_stricmp(lv, "debug")   ? WGPULogLevel_Debug
-                                   : !_stricmp(lv, "trace")   ? WGPULogLevel_Trace
+                                   : !rx_platform::casecmp(lv, "off")     ? WGPULogLevel_Off
+                                   : !rx_platform::casecmp(lv, "error")   ? WGPULogLevel_Error
+                                   : !rx_platform::casecmp(lv, "info")    ? WGPULogLevel_Info
+                                   : !rx_platform::casecmp(lv, "debug")   ? WGPULogLevel_Debug
+                                   : !rx_platform::casecmp(lv, "trace")   ? WGPULogLevel_Trace
                                                               : WGPULogLevel_Warn;
         wgpuSetLogCallback(
             [](WGPULogLevel l, WGPUStringView message, void*) {
@@ -383,13 +393,37 @@ bool init_device(HWND hwnd) {
         return false;
     }
     if (hwnd) {
+#ifdef _WIN32
         WGPUSurfaceSourceWindowsHWND src{};
         src.chain.sType = WGPUSType_SurfaceSourceWindowsHWND;
         src.hinstance = GetModuleHandleA(nullptr);
         src.hwnd = hwnd;
+#else
+        const auto *window = static_cast<const HosLinuxWindow *>(hwnd);
+        if (!window->display || !window->window) { hos_log("rx: SDL native window handles unavailable"); return false; }
+        WGPUSurfaceSourceWaylandSurface wayland{};
+        WGPUSurfaceSourceXlibWindow xlib{};
+        WGPUChainedStruct *chain = nullptr;
+        if (window->backend == 1) {
+            wayland.chain.sType = WGPUSType_SurfaceSourceWaylandSurface;
+            wayland.display = window->display; wayland.surface = (void *)(uintptr_t)window->window;
+            chain = &wayland.chain;
+        } else if (window->backend == 2) {
+            xlib.chain.sType = WGPUSType_SurfaceSourceXlibWindow;
+            xlib.display = window->display; xlib.window = window->window;
+            chain = &xlib.chain;
+        } else { hos_log("rx: unsupported SDL window backend"); return false; }
+#endif
         WGPUSurfaceDescriptor sd{};
+#ifdef _WIN32
         sd.nextInChain = &src.chain;
+#else
+        sd.nextInChain = chain;
+#endif
         surface = wgpuInstanceCreateSurface(dev.instance, &sd);
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+        if (!surface) return false;
+#endif
     }
 #endif
 
@@ -560,10 +594,18 @@ bool init_device(HWND hwnd) {
 #ifdef __EMSCRIPTEN__
     present_mode = WGPUPresentMode_Fifo;
     configure_surface(1280, 720);
+#elif defined(__linux__)
+    int width = 1, height = 1;
+    if (hwnd) {
+        auto *window = static_cast<const HosLinuxWindow *>(hwnd);
+        window->size(window->native, &width, &height);
+    }
+    configure_surface(std::max(width,1), std::max(height,1));
+    present_window_size(width,height);
 #else
     RECT rc;
-    GetClientRect(hwnd, &rc);
-    configure_surface((uint32_t)std::max<LONG>(rc.right, 1), (uint32_t)std::max<LONG>(rc.bottom, 1));
+    GetClientRect(static_cast<HWND>(hwnd), &rc);
+    configure_surface((uint32_t)std::max<int32_t>(rc.right, 1), (uint32_t)std::max<int32_t>(rc.bottom, 1));
     present_window_size(rc.right, rc.bottom);   // (ultrawide's aspect before the game makes its cameras)
 #endif
 
@@ -1347,7 +1389,7 @@ int64_t clock_ns() {
     static const double ns_per_tick = [] {
         const int64_t t0 = hos_now_ns();
         const uint64_t c0 = __rdtsc();
-        Sleep(20);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
         const int64_t t1 = hos_now_ns();
         const uint64_t c1 = __rdtsc();
         return c1 > c0 ? double(t1 - t0) / double(c1 - c0) : 0.0;
@@ -2450,7 +2492,7 @@ void surface_present(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww,
     if (view) wgpuTextureViewRelease(view);
 }
 
-void present_on_submit_thread(WGPUTextureView view, uint32_t sw, uint32_t sh, LONG ww, LONG wh, bool debug_present) {
+void present_on_submit_thread(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, int32_t wh, bool debug_present) {
     // frame interpolation (F7): the frame and the ones made between it and the last go to the display thread
     if (view && !debug_present && present_framegen() && framegen_frame(view, sw, sh, ww, wh)) return;
     surface_present(view, sw, sh, ww, wh, debug_present);
@@ -3725,10 +3767,10 @@ int rx_start(void* hwnd) {
     if (getenv("RX_OFF")) return 0;
 #if RX_WEB_MT
     bool made = false;   // (the device belongs to the WebGPU thread: made there)
-    on_gpu("init_device", [&] { made = init_device(static_cast<HWND>(hwnd)); });
+    on_gpu("init_device", [&] { made = init_device(hwnd); });
     if (!made) {
 #else
-    if (!init_device(static_cast<HWND>(hwnd))) {
+    if (!init_device(hwnd)) {
 #endif
         hos_log("rx: no WebGPU device: the window shows the window buffers' memory");
         return 0;
@@ -3742,8 +3784,8 @@ int rx_active(void) {
 }
 
 void rx_resize(int width, int height) {
-    InterlockedExchange(&want_w, width);
-    InterlockedExchange(&want_h, height);
+    want_w.store(width, std::memory_order_relaxed);
+    want_h.store(height, std::memory_order_relaxed);
     present_window_size(width, height);
 }
 
@@ -4428,7 +4470,11 @@ int rx_present(uint64_t guest, uint32_t width, uint32_t height) {
     if (static const bool ab = getenv("HOS_AB") != nullptr; ab) {   // (the patched wgpu flips its switch with HOS_AB)
         using SetPhase = void (*)(uint32_t);
         static const auto set_phase =
+#ifdef _WIN32
             reinterpret_cast<SetPhase>(GetProcAddress(GetModuleHandleA("wgpu_native.dll"), "wgpuTotkSetAbPhase"));
+#else
+            reinterpret_cast<SetPhase>(dlsym(RTLD_DEFAULT, "wgpuTotkSetAbPhase"));
+#endif
         if (set_phase) set_phase(ab_flipped() ? 1u : 0u);
     }
 #endif
@@ -4641,7 +4687,7 @@ int rx_present(uint64_t guest, uint32_t width, uint32_t height) {
         wgpuTextureViewAddRef(view);
         sw = cw, sh = ch;
     }
-    const LONG ww = want_w, wh = want_h;
+    const int32_t ww = want_w, wh = want_h;
     queue_present([view, sw, sh, ww, wh, debug_present] { present_on_submit_thread(view, sw, sh, ww, wh, debug_present); });
     return im != nullptr;
 }

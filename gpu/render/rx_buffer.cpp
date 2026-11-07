@@ -20,7 +20,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#include <windows.h>
+#include "rx_platform.h"
 
 #include "rx_internal.h"
 
@@ -70,7 +70,7 @@ struct PageTable {
     bool empty() const { return !n; }
     size_t size() const { return n; }
     void assign(size_t count, T) {
-        p = static_cast<T*>(VirtualAlloc(nullptr, count * sizeof(T), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        p = static_cast<T*>(rx_platform::allocate(count * sizeof(T)));
         n = p ? count : 0;
     }
     T& operator[](size_t i) { return p[i]; }
@@ -395,6 +395,7 @@ bool collect_written_pages(std::vector<uint32_t>& out) {
         return true;
     }
 #endif
+#ifdef _WIN32
     if (!watch_ok) return false;
     // only the memory mapped into the GPU's address space (what the renderer can read); the cost of GetWriteWatch
     // grows with the range, not with the pages written
@@ -451,6 +452,9 @@ bool collect_written_pages(std::vector<uint32_t>& out) {
         hos_log("rx: change tracking watches %d ranges, %llu MB", nranges, (unsigned long long)(total >> 20));
     }
     return true;
+#else
+    return false; // Without software tracking, conservatively upload every draw.
+#endif
 }
 
 /// Pages the CPU wrote (collect_written_pages) are invalidated (called with no batch open).
@@ -690,10 +694,12 @@ void buffer_cache_sync_to_guest(uint64_t gpu_va, uint64_t size) {
         uint8_t* dst = hos_guest_base() + p0 * kPage;
         // (pages the CPU wrote since the last scan keep their write-watch mark; the others are not reported as CPU
         // writes: the segment already holds this)
+#ifdef _WIN32
         std::vector<void*> dirty(p1 - p0 + 1);
         ULONG_PTR ndirty = dirty.size();
         DWORD gran = 0;
         const bool watched = !GetWriteWatch(0, dst, n, dirty.data(), &ndirty, &gran);
+#endif
         const auto* src = static_cast<const uint8_t*>(wgpuBufferGetConstMappedRange(staging, 0, n));
         std::lock_guard lk(shadow_mu);
         for (uint64_t p = p0; p <= p1; p++) {
@@ -711,7 +717,9 @@ void buffer_cache_sync_to_guest(uint64_t gpu_va, uint64_t size) {
             for (uint32_t w = 0; w < kPage / 4; w++)
                 if (gw[w] != sw[w]) dw[w] = gw[w];
         }
+#ifdef _WIN32
         if (watched && ndirty == 0) ResetWriteWatch(dst, n);
+#endif
         wgpuBufferUnmap(staging);
         for (uint64_t p = p0; p <= p1; p++) {
             gpu_pages[p] = 0;
