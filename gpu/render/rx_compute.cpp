@@ -6,6 +6,7 @@
 #include "common/div_ceil.h"
 
 #include "rx_internal.h"
+#include "rx_movie.h"
 
 namespace rx {
 uint64_t dispatch_write_epoch = 0;
@@ -326,6 +327,113 @@ void dispatch(const ComputeLaunch& l) {
 
 } // namespace
 
+// A rejected movie network's final image-writing pass can still display the decoded colour frame.
+// Match vk_draw.cpp's fallback: only the program's declared slots, and never an image it also samples.
+bool nvn_upscale_fallback(const NvnState& s, bool movie_network) {
+    if (movie_network) {
+        // OoT's network's final pass has 21 words of push constants and reads its feature-map SSBO.
+        // After an earlier tensor pass failed, this final pass cannot consume those unwritten features,
+        // even when its own shader translates. Other translated dispatches retain their normal behavior.
+        bool finish = false;
+        for (unsigned i = 0; i < s.prog.nstage && i < 6; ++i) {
+            uint16_t stage = 0;
+            uint8_t push = 0, ssbo = 0;
+            const auto control = s.prog.sd[i].control;
+            if (control && gpu_read(control + 0x56, &stage, 2) && stage == 5 &&
+                gpu_read(control + 0xa9, &push, 1) && gpu_read(control + 0xb2, &ssbo, 1) && push == 21 && ssbo) finish = true;
+        }
+        if (!finish) return false;
+    }
+    if (!s.has_prog || env_flag("RX_NO_UPSCALE_FALLBACK")) return false;
+    uint32_t nt = 0, ni = 0;
+    nvn_compute_slots(s, nt, ni);
+    struct Slot { nvn_tex t; nvn_view v; bool has_view; uint64_t handle; };
+    std::vector<Slot> textures, images;
+    auto slots = [&](const uint64_t* handles, uint32_t n, std::vector<Slot>& out) {
+        for (uint32_t i = 0; i < n; ++i) {
+            Slot a{};
+            a.handle = handles[i];
+            if (!a.handle || !nvn_texture_of(a.handle & 0xfffff, &a.t, &a.v, &a.has_view)) continue;
+            out.push_back(a);
+        }
+    };
+    // Keep every declared storage address for feedback checks, including views the fallback cannot handle.
+    auto eligible = [](const Slot& a) {
+        return a.t.d.target == NVN_TEXTURE_TARGET_2D && a.t.d.depth <= 1 && a.t.d.samples <= 1 &&
+               a.t.d.levels == 1 && a.t.d.width && a.t.d.height &&
+               (!a.has_view || ((!a.v.set_levels || (!a.v.base_level && a.v.nlevels == 1)) &&
+                (!a.v.set_layers || (!a.v.min_layer && a.v.nlayers == 1)) && !a.v.set_swizzle &&
+                (!a.v.set_format || a.v.format == a.t.d.format) &&
+                (!a.v.set_target || a.v.target == a.t.d.target)));
+    };
+    slots(s.tex[5], nt, textures);
+    slots(s.img[5], ni, images);
+    auto contains = [](const std::vector<Slot>& slots, uint64_t gpu) {
+        return std::any_of(slots.begin(), slots.end(), [&](const Slot& a) { return a.t.gpu == gpu ||
+            (nvn_gpu_guest(gpu) && nvn_gpu_guest(a.t.gpu) == nvn_gpu_guest(gpu)); });
+    };
+    const Slot *in = nullptr, *out = nullptr;
+    for (const auto& a : images)
+        if (eligible(a) && a.t.d.format == NVN_FORMAT_RGBA8 && !contains(textures, a.t.gpu) &&
+            (!out || uint64_t(a.t.d.width) * a.t.d.height > uint64_t(out->t.d.width) * out->t.d.height)) out = &a;
+    if (!out) return false;
+    for (const auto& a : textures)
+        if (eligible(a) && a.t.d.format == NVN_FORMAT_RGBA8 && !contains(images, a.t.gpu) &&
+            (!in || uint64_t(a.t.d.width) * a.t.d.height > uint64_t(in->t.d.width) * in->t.d.height)) in = &a;
+    if (!in || out->t.d.width <= in->t.d.width || out->t.d.height <= in->t.d.height ||
+        uint64_t(in->t.d.width) * out->t.d.height != uint64_t(out->t.d.width) * in->t.d.height) return false;
+    Shader::TextureDescriptor desc{};
+    desc.type = Shader::TextureType::Color2D;
+    const BoundTexture src = nvn_texture(s, in->handle, 0, desc);
+    Image* dst = nvn_target(&out->t, nullptr);
+    if (!src.view || src.source == 'd' || !dst || dst->format != WGPUTextureFormat_RGBA8Unorm ||
+        (src.kind != TexKind::Float && src.kind != TexKind::UnfilterableFloat)) return false;
+    static WGPUComputePipeline pipeline = nullptr;
+    static WGPUBindGroupLayout layout = nullptr;
+    if (!pipeline) {
+        WGPUShaderSourceWGSL wgsl{};
+        wgsl.chain.sType = WGPUSType_ShaderSourceWGSL;
+        wgsl.code = sv(movie_upscale_wgsl);
+        WGPUShaderModuleDescriptor md{};
+        md.nextInChain = &wgsl.chain;
+        WGPUComputePipelineDescriptor pd{};
+        scope_push();
+        WGPUShaderModule module = wgpuDeviceCreateShaderModule(dev.device, &md);
+        pd.compute.module = module;
+        pd.compute.entryPoint = sv("main");
+        pipeline = wgpuDeviceCreateComputePipeline(dev.device, &pd);
+        wgpuShaderModuleRelease(module);
+        const auto error = scope_pop();
+        if (!error.empty()) {
+            if (pipeline) wgpuComputePipelineRelease(pipeline);
+            pipeline = nullptr;
+            log_limited("movie_upscale_failed", 1, "rx: movie upscale: %s", error.c_str());
+            return false;
+        }
+        layout = wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
+    }
+    WGPUBindGroupEntry entries[2]{};
+    entries[0].binding = 0, entries[0].textureView = src.view;
+    entries[1].binding = 1, entries[1].textureView = dst->attachment;
+    WGPUBindGroupDescriptor bd{};
+    bd.layout = layout, bd.entryCount = 2, bd.entries = entries;
+    WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev.device, &bd);
+    end_render_pass();
+    auto pass = ce_begin_compute_pass(encoder());
+    cp_set_pipeline(pass, pipeline);
+    cp_set_bind_group(pass, 0, group, 0, nullptr);
+    cp_dispatch(pass, (dst->width + 7) / 8, (dst->height + 7) / 8, 1);
+    cp_end(pass);
+    wgpuBindGroupRelease(group);
+    dst->rendered = true;
+    dst->version++;
+    dispatch_write_epoch++;
+    count("nvn_upscale_fallback");
+    log_limited("nvn_upscale_fallback", 4, "rx: untranslatable NVN2 upscale: %ux%u -> %ux%u, bilinear",
+                in->t.d.width, in->t.d.height, out->t.d.width, out->t.d.height);
+    return true;
+}
+
 // ---- the native NVN layer's dispatches: the bound program's compute stage, its banks from NVN state (c0: the
 // driver's storage buffer table at 0x310, the grid at 0x200, the uniform buffer table at 0x210; c2: handles) ----
 void nvn_dispatch(NvnState& s, uint32_t x, uint32_t y, uint32_t z, uint64_t indirect_va) {
@@ -342,7 +450,14 @@ void nvn_dispatch(NvnState& s, uint32_t x, uint32_t y, uint32_t z, uint64_t indi
     s.grid[0] = x, s.grid[1] = y, s.grid[2] = z;
     if (!x || !y || !z) return count("cs_empty");
     ShaderModule* m = nvn_compute_module(s);
-    if (!m) return count("cs_skipped");
+    static int64_t tensor_missing_frame = -1;
+    if (!m && nvn_cs_tensor_unavailable(s)) tensor_missing_frame = frame_number;
+    if (!indirect_va && tensor_missing_frame == frame_number && nvn_upscale_fallback(s, true))
+        return count("dispatches");
+    if (!m) {
+        if (!indirect_va && nvn_upscale_fallback(s)) return count("dispatches");
+        return count("cs_skipped");
+    }
     const Shader::Info& info = m->info;
     if (!info.image_buffer_descriptors.empty() || !info.texture_buffer_descriptors.empty()) {
         log_limited("nvn_cs_images", 8, "rx: an NVN compute program uses image or texture buffers: not dispatched yet");

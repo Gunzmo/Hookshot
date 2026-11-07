@@ -253,10 +253,12 @@ bool nvn_sampler_of(int id, nvn_samp_par* p) {
 // uniform buffer table (16 bytes a slot: address, size), the storage buffer table (the same), texture handles and
 // image handles (8 bytes a slot), as many slots of each as the program's control section says (+0xb1 uniform
 // buffers, +0xb2 storage buffers, +0xb3 textures, +0xb6 images). Found from 173 programs' reads, all of which fit.
+// Push constants (+0xa9 words, rounded to 16 bytes) precede the tables, as in vk_bank.cpp.
 // Graphics programs keep the fixed layout below (c2 texture handles at 0x20 + 8 slot).
 struct Nvn2CsLayout {
-    uint32_t ubo = 0, ssbo = 0, tex = 0, img = 0;   // slot counts
-    uint32_t ssbo_at() const { return 0x10 + 16 * ubo; }
+    uint32_t ubo = 0, ssbo = 0, tex = 0, img = 0, push = 0;
+    uint32_t ubo_at() const { return 0x10 + push; }
+    uint32_t ssbo_at() const { return ubo_at() + 16 * ubo; }
     uint32_t tex_at() const { return ssbo_at() + 16 * ssbo; }
     uint32_t img_at() const { return tex_at() + 8 * tex; }
     uint32_t end() const { return img_at() + 8 * img; }
@@ -276,11 +278,18 @@ Nvn2CsLayout nvn2_cs_layout(const NvnState& s) {
         gpu_read(s.prog.sd[i].control + 0x56, &st, 2);
         if (magic != 0x98761234 || st != 5) continue;
         l.ubo = c[0xb1 - 0x58], l.ssbo = c[0xb2 - 0x58], l.tex = c[0xb3 - 0x58], l.img = c[0xb6 - 0x58];
+        l.push = ((uint32_t)c[0xa9 - 0x58] * 4 + 15) & ~15u;
         break;
     }
     if (by_serial.size() > 4096) by_serial.clear();
     by_serial[s.prog.serial] = l;
     return l;
+}
+
+void nvn_compute_slots(const NvnState& s, uint32_t& textures, uint32_t& images) {
+    const auto l = nvn2_cs_layout(s);
+    textures = std::min(l.tex, 128u);
+    images = std::min(l.img, 32u);
 }
 
 void nvn_driver_bank(const NvnState& s, int bank, int stage, uint8_t d[0xA00]) {
@@ -289,13 +298,14 @@ void nvn_driver_bank(const NvnState& s, int bank, int stage, uint8_t d[0xA00]) {
     if (bank == 0 && stage == 5) {   // (NVN2 compute: see Nvn2CsLayout)
         const Nvn2CsLayout l = nvn2_cs_layout(s);
         std::memcpy(d, s.grid, sizeof s.grid);
+        std::memcpy(d + 0x10, s.cs_push, std::min(l.push, s.cs_push_n));
         auto entry = [&](uint32_t at, const nvn_p_bind_buf& e) {
             if (at + 16 > 0xA00) return;
             const uint32_t n = (uint32_t)e.size;
             std::memcpy(d + at, &e.addr, 8);
             std::memcpy(d + at + 8, &n, 4);
         };
-        for (uint32_t r = 0; r < l.ubo && r < 16; r++) entry(0x10 + 16 * r, s.ubo[5][r]);
+        for (uint32_t r = 0; r < l.ubo && r < 16; r++) entry(l.ubo_at() + 16 * r, s.ubo[5][r]);
         for (uint32_t r = 0; r < l.ssbo && r < 16; r++) entry(l.ssbo_at() + 16 * r, s.ssbo[5][r]);
         for (uint32_t r = 0; r < l.tex && r < 128 && l.tex_at() + 8 * r + 4 <= 0xA00; r++) {
             const uint32_t th = (uint32_t)s.tex[5][r];
@@ -371,7 +381,13 @@ uint32_t nvn_driver_bank_word(const NvnState& s, int bank, int stage, uint32_t o
         auto entry = [&](const nvn_p_bind_buf& e, uint32_t in) -> uint32_t {
             return in == 0 ? lo(e.addr) : in == 4 ? hi(e.addr) : in == 8 ? (uint32_t)e.size : 0;
         };
-        if (offset < l.ssbo_at()) return (offset - 0x10) / 16 < 16 ? entry(s.ubo[5][(offset - 0x10) / 16], (offset - 0x10) % 16) : 0;
+        if (offset < l.ubo_at()) {
+            uint32_t word = 0;
+            if (offset - 0x10 + 4 <= s.cs_push_n) std::memcpy(&word, s.cs_push + offset - 0x10, 4);
+            return word;
+        }
+        if (offset < l.ssbo_at())
+            return (offset - l.ubo_at()) / 16 < 16 ? entry(s.ubo[5][(offset - l.ubo_at()) / 16], (offset - l.ubo_at()) % 16) : 0;
         if (offset < l.tex_at())
             return (offset - l.ssbo_at()) / 16 < 16 ? entry(s.ssbo[5][(offset - l.ssbo_at()) / 16], (offset - l.ssbo_at()) % 16) : 0;
         if (offset < l.img_at()) return (offset & 7) ? 0 : lo(s.tex[5][std::min<uint32_t>((offset - l.tex_at()) / 8, 127)]);
@@ -1019,6 +1035,14 @@ void cond_recheck_present() {
         }
         case NOP_SET_TEX_POOL: case NOP_SET_SAMP_POOL: break;
         case NOP_COPY_STRIDE: s.copy_stride = payload<nvn_p_copy_stride>(a, avail).stride; break;
+        case NOP_PUSH_CONST: {
+            const auto u = payload<nvn_p_push_const>(a, avail);
+            if (avail >= sizeof u && u.size <= avail - sizeof u && (uint64_t)u.offset + u.size <= sizeof s.cs_push) {
+                std::memcpy(s.cs_push + u.offset, a + sizeof u, u.size);
+                s.cs_push_n = std::max(s.cs_push_n, u.offset + u.size);
+            }
+            break;
+        }
         case NOP_BARRIER: {   // (what was drawn is visible to texture reads after it: feedback snapshots are taken again)
             int32_t flags = 0;
             std::memcpy(&flags, a, std::min<uint32_t>(4, avail));

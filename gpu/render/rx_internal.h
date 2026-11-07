@@ -635,6 +635,8 @@ struct NvnState {
     uint32_t grid[3]{};        // the dispatch being made (compute programs read it from c0)
     // bumped when what picks a program variant changes (program, vertex attributes / streams, texture, sampler and
     // image handles; a rebind of the same values does not count): nvn_programs reuses an answer while it stays.
+    uint8_t cs_push[0x400]{}; // NVN2 compute c0, immediately after the grid
+    uint32_t cs_push_n = 0;
     uint64_t prog_epoch = 1;
     // the vertex attributes and streams by content (set when they change): the program variants and pull plans
     // memoized for each, as draws of different materials take turns (an epoch bumped at every program bind was not)
@@ -704,6 +706,10 @@ bool nvn_sampler_of(int id, nvn_samp_par* p);   // rx_nvn.cpp: the registered sa
 /// The driver's constant bank c0 (storage buffer table) / c2 (texture and sampler handle tables) of a stage as the
 /// NVN driver lays them out (0xA00 bytes): what translated programs read for their bindings
 void nvn_driver_bank(const NvnState& s, int bank, int stage, uint8_t out[0xA00]);
+void nvn_compute_slots(const NvnState& s, uint32_t& textures, uint32_t& images);
+// Rejected NVN2 movie network: spatial upscale of its colour input, as in the Vulkan renderer.
+bool nvn_upscale_fallback(const NvnState& s, bool movie_network = false);
+bool nvn_cs_tensor_unavailable(const NvnState& s);
 
 /// What a shader can read of a uniform buffer bound with `size` bytes: the console's driver binds whole 256-byte
 /// blocks (RX_NVN_UBO_EXACT=1: only the bytes bound)

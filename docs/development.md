@@ -75,8 +75,23 @@ readback preserves software dirty marks. Windows keeps its native surface and wr
 
 Point `WGPU_NATIVE` at a wgpu-native distribution containing `include/webgpu/` and `lib/libwgpu_native.so`, then
 build with the normal Linux runtime command. Native platform tests need no WebGPU distribution. The optional
-runtime check links the built renderer objects into a temporary device-initialization harness and uses a software
-Vulkan adapter when available:
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:10f57dd2d3da27321162814bdbd5bb226bb25e83a96dfd1565876ca7f5bca0d6 -->
+
+runtime check links the built renderer objects into a temporary harness and uses a software Vulkan adapter when
+available. It checks packed NVN2 compute banks, partial push-constant replay, the font comparison instruction and
+GPU pixels from the movie upscale fallback. The fallback uses bilinear scaling when a compute program cannot
+translate; it preserves the decoded colour image without the neural network's detail. Set
+`RX_NO_UPSCALE_FALLBACK=1` to disable it for diagnosis. The default tests also check the native instructions reported
+by the font and movie paths, without needing a WebGPU distribution.
+
+If a run reports that `libhookshot_vk.so` is missing and falls back to WebGPU, install the built Vulkan library
+beside the executable to use `RX_BACKEND=vulkan`. Selecting that backend alone does not install the library.
+
+Commands:
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 <!-- coderabbit-ai-generated:v1 -->
 
@@ -84,7 +99,14 @@ Vulkan adapter when available:
 
 ```sh
 python -I -B tests/test_webgpu_linux.py
-WGPU_NATIVE=/path/to/wgpu-native python -I nx2/build.py --part runtime --target linux
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:03d0a1852cbcabb7a0f6c2c2189f85c727c0f54c0ae6e58d04bc51ed69a890a3 -->
+
+export WGPU_NATIVE=/path/to/wgpu-native
+python -I nx2/build.py --part runtime --target linux
+
+<!-- /coderabbit-ai-generated:v1 -->
 python -I -B tests/test_webgpu_linux.py --runtime work/runtime-linux
 ```
 

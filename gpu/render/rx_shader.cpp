@@ -1007,7 +1007,7 @@ struct NvnCode {
     std::vector<uint8_t> c1;
     uint32_t local[3]{};
     uint32_t shared = 0, local_memory = 0;   // compute: workgroup shared memory, local memory bytes
-    bool ok = false;
+    bool ok = false, needs_tensor = false;
 };
 
 constexpr uint32_t kNvn2ControlMagic = 0x98761234;
@@ -1052,6 +1052,9 @@ NvnCode read_nvn_code(const nvn_stage_data& sd) {
         }
         if (r == Shader::Ampere::ProgramCaptureState::Result::Complete) break;
     }
+    c.needs_tensor = std::any_of(native.begin(), native.end(), [](const Instruction& i) {
+        return i.Bits(0, 12) == 0x23c && i.Bits(12, 4) != 15;
+    });
     const auto lowered = Shader::Ampere::LowerToMaxwell(native);
     if (!lowered) {
         const uint32_t at = lowered.error_offset / 16;
@@ -1276,16 +1279,21 @@ const NvnCode* nvn_cs_code(const NvnState& s) {
         c = std::make_unique<NvnCode>();
         for (uint32_t i = 0; i < s.prog.nstage && i < 6; i++) {
             NvnCode k = read_nvn_code(s.prog.sd[i]);
-            if (k.ok && k.stage == 5) {
+            if (k.stage == 5) {
                 *c = std::move(k);
                 break;
             }
         }
     }
-    return c->ok ? c.get() : nullptr;
+    return c.get();
 }
 
 }  // namespace
+
+bool nvn_cs_tensor_unavailable(const NvnState& s) {
+    const NvnCode* code = s.has_prog ? nvn_cs_code(s) : nullptr;
+    return code && code->needs_tensor && !code->ok;
+}
 
 uint64_t nvn_cs_key(const NvnState& s) {
     const NvnCode* code = s.has_prog ? nvn_cs_code(s) : nullptr;
@@ -1297,7 +1305,7 @@ ShaderModule* nvn_compute_module(const NvnState& s, const std::array<uint8_t, 64
                                  const std::array<uint16_t, 16>* image_formats) {
     if (!s.has_prog) return nullptr;
     const NvnCode* code = nvn_cs_code(s);
-    if (!code) return nullptr;
+    if (!code || !code->ok) return nullptr;
     static const std::array<uint8_t, 64> no_alias{};
     static const std::array<uint32_t, 64> no_words{};
     const auto& alias = ssbo_alias ? *ssbo_alias : no_alias;

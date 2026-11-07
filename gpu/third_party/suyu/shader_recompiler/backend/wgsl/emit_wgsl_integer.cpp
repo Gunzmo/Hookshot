@@ -107,7 +107,13 @@ void EmitIAbs64(EmitContext& ctx, IR::Inst& inst, std::string_view value) {
 
 void EmitShiftLeftLogical32(EmitContext& ctx, IR::Inst& inst, std::string_view base,
                             std::string_view shift) {
-    ctx.AddU32("{}={}<<{};", inst, base, shift);
+    // WGSL rejects overflowing constant expressions, whereas guest U32 shifts wrap.
+    // Fold two immediate operands with U32 semantics before emitting a WGSL literal.
+    if (inst.Arg(0).IsImmediate() && inst.Arg(1).IsImmediate()) {
+        ctx.AddU32("{}={}u;", inst, inst.Arg(0).U32() << (inst.Arg(1).U32() & 31));
+    } else {
+        ctx.AddU32("{}={}<<{};", inst, base, shift);
+    }
 }
 
 void EmitShiftLeftLogical64(EmitContext& ctx, IR::Inst& inst, std::string_view base,
