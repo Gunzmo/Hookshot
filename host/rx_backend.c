@@ -3,10 +3,19 @@
    executable. Decided at rx_start, before any other rx_* call; a DLL that is missing or finds no usable Vulkan
    device leaves the WebGPU renderer in place (logged). */
 #include "hos.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#include <limits.h>
+#include <pthread.h>
+#include <strings.h>
+#include <unistd.h>
+#endif
 
 #include "../gpu/vk/vk_api.h"
 
@@ -156,16 +165,30 @@ typedef struct {
 } early_call;
 static early_call *early;
 static size_t n_early, cap_early;
-static volatile LONG started;   /* rx_start chose (the calls go straight to the renderer from then on) */
+/* The renderer choice is published after the queued calls are flushed. */
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)
+static volatile LONG started;
 static SRWLOCK early_lock = SRWLOCK_INIT;
+#define early_started() (started != 0)
+#define early_publish() ((void)InterlockedExchange(&started, 1))
+#define early_acquire() AcquireSRWLockExclusive(&early_lock)
+#define early_release() ReleaseSRWLockExclusive(&early_lock)
+#else
+static int started;
+static pthread_mutex_t early_lock = PTHREAD_MUTEX_INITIALIZER;
+#define early_started() __atomic_load_n(&started, __ATOMIC_ACQUIRE)
+#define early_publish() __atomic_store_n(&started, 1, __ATOMIC_RELEASE)
+#define early_acquire() pthread_mutex_lock(&early_lock)
+#define early_release() pthread_mutex_unlock(&early_lock)
+#endif
 
 static void forward(const early_call *c);
 /* Keeps a call made before rx_start; 0 when the renderer is chosen already (the caller forwards it) */
 static int keep_early(const early_call *c) {
-    if (started) return 0;
-    AcquireSRWLockExclusive(&early_lock);
-    if (started) {
-        ReleaseSRWLockExclusive(&early_lock);
+    if (early_started()) return 0;
+    early_acquire();
+    if (early_started()) {
+        early_release();
         return 0;
     }
     if (n_early == cap_early) {
@@ -173,22 +196,23 @@ static int keep_early(const early_call *c) {
         early = (early_call *)realloc(early, cap_early * sizeof *early);
     }
     early[n_early++] = *c;
-    ReleaseSRWLockExclusive(&early_lock);
+    early_release();
     return 1;
 }
 /* rx_start: the kept calls given to the renderer chosen, then the gate opened */
 static void flush_early(void) {
-    AcquireSRWLockExclusive(&early_lock);
+    early_acquire();
     for (size_t i = 0; i < n_early; i++) forward(&early[i]);
     if (n_early) hos_log("rx: %zu texture and sampler calls made before the renderer started, given to it", n_early);
     free(early);
     early = NULL, n_early = cap_early = 0;
-    InterlockedExchange(&started, 1);
-    ReleaseSRWLockExclusive(&early_lock);
+    early_publish();
+    early_release();
 }
 
 /* dll: mkw_vk.dll (our Vulkan back end) or mkw_eden.dll (Eden's renderer driven natively, gpu/eden): one export */
 static const MkwVkRenderer *load_vulkan(const char *dll) {
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)
     char path[MAX_PATH];
     const DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
     char *slash = n ? strrchr(path, HOS_SEP) : NULL;
@@ -200,6 +224,21 @@ static const MkwVkRenderer *load_vulkan(const char *dll) {
         return NULL;
     }
     mkwvk_init_fn init = (mkwvk_init_fn)(void *)GetProcAddress(m, "mkwvk_init");
+#else
+    char path[PATH_MAX];
+    const ssize_t n = readlink("/proc/self/exe", path, sizeof path - 1);
+    if (n < 0 || (size_t)n >= sizeof path - 1) return NULL;
+    path[n] = '\0';
+    char *slash = strrchr(path, '/');
+    if (!slash || snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "%s", dll) >=
+                      (int)(sizeof path - (size_t)(slash + 1 - path))) return NULL;
+    void *m = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!m) {
+        hos_log("rx: RX_BACKEND=vulkan, but %s did not load (%s): WebGPU", path, dlerror());
+        return NULL;
+    }
+    mkwvk_init_fn init = (mkwvk_init_fn)dlsym(m, "mkwvk_init");
+#endif
     const MkwVkRenderer *r = init ? init(&vk_host) : NULL;
     if (!r || r->version != MKWVK_API_VERSION) {
         hos_log("rx: the Vulkan back end did not start: WebGPU");
@@ -210,9 +249,19 @@ static const MkwVkRenderer *load_vulkan(const char *dll) {
 
 int rx_start(void *hwnd) {
     const char *b = getenv("RX_BACKEND");
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)
     const int eden = b && !_stricmp(b, "eden");
-    if (!b || !_stricmp(b, "vulkan") || eden) {   /* (hookshot: Vulkan unless told otherwise; a started game has no RX_BACKEND) */
+    const int vulkan = !b || !_stricmp(b, "vulkan");
+#else
+    const int eden = b && !strcasecmp(b, "eden");
+    const int vulkan = !b || !strcasecmp(b, "vulkan");
+#endif
+    if (vulkan || eden) {   /* (hookshot: Vulkan unless told otherwise; a started game has no RX_BACKEND) */
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)
         const char *dll = eden ? "mkw_eden.dll" : "hookshot_vk.dll";
+#else
+        const char *dll = eden ? "libmkw_eden.so" : "libhookshot_vk.so";
+#endif
         const MkwVkRenderer *r = load_vulkan(dll);
         if (r && r->start(hwnd)) {
             vk = r;
@@ -229,7 +278,11 @@ int rx_start(void *hwnd) {
 /* (hookshot) hookshot_rt --prepare-shaders: the Vulkan back end started with no window and no game, which prepares
    every shader in its start (gpu/vk/vk_main.cpp started_up) and is then let go. 0 when there is no usable Vulkan */
 int rx_prepare_shaders(void) {
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)
     const MkwVkRenderer *r = load_vulkan("hookshot_vk.dll");
+#else
+    const MkwVkRenderer *r = load_vulkan("libhookshot_vk.so");
+#endif
     return r && r->start(NULL);
 }
 void rx_resize(int width, int height) { vk ? vk->resize(width, height) : wgr_resize(width, height); }
@@ -267,7 +320,7 @@ static void forward(const early_call *c) {
     }
 }
 void rx_nvn_register_texture(int id, const nvn_tex *t, const nvn_view *v) {
-    if (!started && t) {
+    if (!early_started() && t) {
         early_call c = {0, id};
         c.t = *t;
         if (v) c.v = *v, c.has_view = 1;
@@ -276,7 +329,7 @@ void rx_nvn_register_texture(int id, const nvn_tex *t, const nvn_view *v) {
     vk ? vk->nvn_register_texture(id, t, v) : wgr_nvn_register_texture(id, t, v);
 }
 void rx_nvn_register_sampler(int id, const nvn_samp_par *p) {
-    if (!started && p) {
+    if (!early_started() && p) {
         early_call c = {1, id};
         c.p = *p;
         if (keep_early(&c)) return;
@@ -284,14 +337,14 @@ void rx_nvn_register_sampler(int id, const nvn_samp_par *p) {
     vk ? vk->nvn_register_sampler(id, p) : wgr_nvn_register_sampler(id, p);
 }
 void rx_nvn_set_texture_pool_size(int n) {
-    if (!started) {
+    if (!early_started()) {
         early_call c = {2, n};
         if (keep_early(&c)) return;
     }
     vk ? vk->nvn_set_texture_pool_size(n) : wgr_nvn_set_texture_pool_size(n);
 }
 void rx_nvn_texture_released(const nvn_tex *t) {
-    if (!started && t) {
+    if (!early_started() && t) {
         early_call c = {3, 0};
         c.t = *t;
         if (keep_early(&c)) return;
@@ -299,7 +352,7 @@ void rx_nvn_texture_released(const nvn_tex *t) {
     vk ? vk->nvn_texture_released(t) : wgr_nvn_texture_released(t);
 }
 void rx_nvn_texture_created(const nvn_tex *t) {
-    if (!started && t) {
+    if (!early_started() && t) {
         early_call c = {4, 0};
         c.t = *t;
         if (keep_early(&c)) return;
