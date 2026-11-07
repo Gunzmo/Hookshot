@@ -1,3 +1,5 @@
+#include "../../host/hos_input.h"
+#include "vk_platform.h"
 // The Insert menu. Drawn on the CPU (GDI text into a bitmap) and copied over the window's image at the last step of a present,
 // so it costs nothing while closed and it never touches the game's picture, nor what frame interpolation sees. Keys: Insert
 // opens and closes it, Up and Down choose, Left and Right change, Esc closes; the game gets no keyboard input while it is open.
@@ -17,7 +19,7 @@
 #endif
 
 namespace mkwvk {
-HWND app_window();
+AppWindow app_window();
 
 Options opts;
 
@@ -70,8 +72,8 @@ std::atomic<bool> open_now{false};
 int selected = 0;
 bool menu_refresh = false;
 std::string ini_path() {
-    char exe[MAX_PATH];
-    const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    char exe[4096];
+    const uint32_t n = vk_platform::executable(exe, sizeof exe);
     std::string dir(exe, n);
     return dir.substr(0, dir.find_last_of("\\/") + 1) + "hookshot_options.ini";
 }
@@ -117,41 +119,41 @@ const char* pad_name(int p) {
 const char* key_name(int vk) {
     static char b[16];
     if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) return b[0] = (char)vk, b[1] = 0, b;
-    if (vk >= VK_F1 && vk <= VK_F12) return snprintf(b, sizeof b, "F%d", vk - VK_F1 + 1), b;
-    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD0 + 9) return snprintf(b, sizeof b, "Num %d", vk - VK_NUMPAD0), b;
+    if (vk >= HOS_KEY_F1 && vk <= HOS_KEY_F12) return snprintf(b, sizeof b, "F%d", vk - HOS_KEY_F1 + 1), b;
+    if (vk >= HOS_KEY_NUMPAD0 && vk <= HOS_KEY_NUMPAD0 + 9) return snprintf(b, sizeof b, "Num %d", vk - HOS_KEY_NUMPAD0), b;
     switch (vk) {
-    case VK_SPACE: return "Space";
-    case VK_SHIFT: return "Shift";
-    case VK_CONTROL: return "Ctrl";
-    case VK_MENU: return "Alt";
-    case VK_TAB: return "Tab";
-    case VK_RETURN: return "Enter";
-    case VK_BACK: return "Backspace";
-    case VK_CAPITAL: return "Caps Lock";
-    case VK_UP: return "Up";
-    case VK_DOWN: return "Down";
-    case VK_LEFT: return "Left";
-    case VK_RIGHT: return "Right";
-    case VK_HOME: return "Home";
-    case VK_END: return "End";
-    case VK_PRIOR: return "Page Up";
-    case VK_NEXT: return "Page Down";
-    case VK_ADD: return "Num +";
-    case VK_SUBTRACT: return "Num -";
-    case VK_MULTIPLY: return "Num *";
-    case VK_DIVIDE: return "Num /";
-    case VK_DECIMAL: return "Num .";
-    case VK_OEM_1: return ";";
-    case VK_OEM_PLUS: return "=";
-    case VK_OEM_COMMA: return ",";
-    case VK_OEM_MINUS: return "-";
-    case VK_OEM_PERIOD: return ".";
-    case VK_OEM_2: return "/";
-    case VK_OEM_3: return "`";
-    case VK_OEM_4: return "[";
-    case VK_OEM_5: return "\\";
-    case VK_OEM_6: return "]";
-    case VK_OEM_7: return "'";
+    case HOS_KEY_SPACE: return "Space";
+    case HOS_KEY_SHIFT: return "Shift";
+    case HOS_KEY_CONTROL: return "Ctrl";
+    case HOS_KEY_MENU: return "Alt";
+    case HOS_KEY_TAB: return "Tab";
+    case HOS_KEY_RETURN: return "Enter";
+    case HOS_KEY_BACK: return "Backspace";
+    case HOS_KEY_CAPITAL: return "Caps Lock";
+    case HOS_KEY_UP: return "Up";
+    case HOS_KEY_DOWN: return "Down";
+    case HOS_KEY_LEFT: return "Left";
+    case HOS_KEY_RIGHT: return "Right";
+    case HOS_KEY_HOME: return "Home";
+    case HOS_KEY_END: return "End";
+    case HOS_KEY_PRIOR: return "Page Up";
+    case HOS_KEY_NEXT: return "Page Down";
+    case HOS_KEY_ADD: return "Num +";
+    case HOS_KEY_SUBTRACT: return "Num -";
+    case HOS_KEY_MULTIPLY: return "Num *";
+    case HOS_KEY_DIVIDE: return "Num /";
+    case HOS_KEY_DECIMAL: return "Num .";
+    case HOS_KEY_OEM_1: return ";";
+    case HOS_KEY_OEM_PLUS: return "=";
+    case HOS_KEY_OEM_COMMA: return ",";
+    case HOS_KEY_OEM_MINUS: return "-";
+    case HOS_KEY_OEM_PERIOD: return ".";
+    case HOS_KEY_OEM_2: return "/";
+    case HOS_KEY_OEM_3: return "`";
+    case HOS_KEY_OEM_4: return "[";
+    case HOS_KEY_OEM_5: return "\\";
+    case HOS_KEY_OEM_6: return "]";
+    case HOS_KEY_OEM_7: return "'";
     }
     return snprintf(b, sizeof b, "Key %d", vk), b;
 }
@@ -161,12 +163,12 @@ const std::vector<int>& bindable_keys() {
     if (k.empty()) {
         for (int c = 'A'; c <= 'Z'; c++) k.push_back(c);
         for (int c = '0'; c <= '9'; c++) k.push_back(c);
-        for (int c = VK_F2; c <= VK_F12; c++) k.push_back(c);
-        for (int c = VK_NUMPAD0; c <= VK_NUMPAD0 + 9; c++) k.push_back(c);
-        for (int c : {VK_SPACE, VK_SHIFT, VK_CONTROL, VK_MENU, VK_TAB, VK_RETURN, VK_BACK, VK_CAPITAL, VK_UP, VK_DOWN,
-                      VK_LEFT, VK_RIGHT, VK_HOME, VK_END, VK_PRIOR, VK_NEXT, VK_ADD, VK_SUBTRACT, VK_MULTIPLY,
-                      VK_DIVIDE, VK_DECIMAL, VK_OEM_1, VK_OEM_PLUS, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD,
-                      VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7})
+        for (int c = HOS_KEY_F2; c <= HOS_KEY_F12; c++) k.push_back(c);
+        for (int c = HOS_KEY_NUMPAD0; c <= HOS_KEY_NUMPAD0 + 9; c++) k.push_back(c);
+        for (int c : {HOS_KEY_SPACE, HOS_KEY_SHIFT, HOS_KEY_CONTROL, HOS_KEY_MENU, HOS_KEY_TAB, HOS_KEY_RETURN, HOS_KEY_BACK, HOS_KEY_CAPITAL, HOS_KEY_UP, HOS_KEY_DOWN,
+                      HOS_KEY_LEFT, HOS_KEY_RIGHT, HOS_KEY_HOME, HOS_KEY_END, HOS_KEY_PRIOR, HOS_KEY_NEXT, HOS_KEY_ADD, HOS_KEY_SUBTRACT, HOS_KEY_MULTIPLY,
+                      HOS_KEY_DIVIDE, HOS_KEY_DECIMAL, HOS_KEY_OEM_1, HOS_KEY_OEM_PLUS, HOS_KEY_OEM_COMMA, HOS_KEY_OEM_MINUS, HOS_KEY_OEM_PERIOD,
+                      HOS_KEY_OEM_2, HOS_KEY_OEM_3, HOS_KEY_OEM_4, HOS_KEY_OEM_5, HOS_KEY_OEM_6, HOS_KEY_OEM_7})
             k.push_back(c);
     }
     return k;
@@ -440,7 +442,7 @@ void menu_note_frame(bool game_frame) {
 // The Fullscreen row and F11 are one setting: the row asks the window's thread (host/display.c), F11 shows in the row
 void fullscreen_tick() {
     static int applied = 0, settle = 0;
-    const HWND main_window = app_window();
+    const AppWindow main_window = app_window();
     if (!main_window) return;
     static const bool env = getenv("HOS_FULLSCREEN") != nullptr;   // (a test's own choice: the row is left alone)
     if (env) return;
@@ -473,15 +475,12 @@ void menu_tick() {
     fullscreen_tick();
     enum { K_N = 10 };
     static bool held[K_N];
-    static const int keys[K_N] = {VK_INSERT, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_ESCAPE, VK_F1,   // (F1: for keyboards without Insert)
-                                  VK_RETURN, VK_DELETE, VK_BACK};
-    HWND fg = GetForegroundWindow();
-    DWORD pid = 0;
-    if (fg) GetWindowThreadProcessId(fg, &pid);
-    const bool mine = pid == GetCurrentProcessId();
+    static const int keys[K_N] = {HOS_KEY_INSERT, HOS_KEY_UP, HOS_KEY_DOWN, HOS_KEY_LEFT, HOS_KEY_RIGHT, HOS_KEY_ESCAPE, HOS_KEY_F1,   // (F1: for keyboards without Insert)
+                                  HOS_KEY_RETURN, HOS_KEY_DELETE, HOS_KEY_BACK};
+    const bool mine = vk_platform::focused();
     bool press[K_N] = {};
     for (int i = 0; i < K_N; i++) {
-        const bool down = mine && (GetAsyncKeyState(keys[i]) & 0x8000) != 0;
+        const bool down = mine && (vk_platform::key(keys[i]) & 0x8000) != 0;
         press[i] = down && !held[i];
         held[i] = down;
     }
@@ -529,7 +528,7 @@ void menu_tick() {
             } else {
                 int down = 0;
                 for (int k : bindable_keys())
-                    if (mine && (GetAsyncKeyState(k) & 0x8000)) {
+                    if (mine && (vk_platform::key(k) & 0x8000)) {
                         down = k;
                         break;
                     }

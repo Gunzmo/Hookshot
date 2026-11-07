@@ -25,7 +25,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "hos_fault.h"
+#include <signal.h>
+#include <sys/mman.h>
+#endif
+#include "hos_platform.h"
+#include "fs_platform.h"
+#ifdef _WIN32
+#define fs_strdup _strdup
+#else
+#define fs_strdup strdup
+#endif
 uint64_t hos_hostcall(const char *name, void (*fn)(Ctx *, void *), void *user);   /* hos_hostcall.c */
 void hos_gpu_track(uint64_t guest, uint64_t size, int on);                          /* nvdrv.c */
 
@@ -55,7 +68,7 @@ static void die(const char *fmt, ...) {
 }
 
 /* ---- serials, GPU addresses, virtual pools ---- */
-static volatile LONG64 serials;
+static volatile int64_t serials;
 static uint64_t new_serial(void) { return (uint64_t)__atomic_add_fetch(&serials, 1, __ATOMIC_SEQ_CST); }
 
 #define VPAGE 0x10000ull                     /* NVN virtual mapping granularity (64 KiB) */
@@ -67,14 +80,14 @@ static uint64_t new_serial(void) { return (uint64_t)__atomic_add_fetch(&serials,
 struct nvn_vmap { uint64_t gpu, size; uint64_t *page; uint32_t *run; struct nvn_vmap *next; };
 static struct nvn_vmap *vmaps, *dead_vmaps;
 static HosRwLock vmap_lock = HOS_RWLOCK_INIT;
-static volatile LONG vmap_gen = 1;           /* bumped when a map is added or removed */
-static volatile LONG vpage_gen = 1;          /* bumped by every virtual page (re)mapping too (the renderer's caches) */
+static volatile int32_t vmap_gen = 1;           /* bumped when a map is added or removed */
+static volatile int32_t vpage_gen = 1;          /* bumped by every virtual page (re)mapping too (the renderer's caches) */
 uint32_t nvn_vmap_generation(void) { return (uint32_t)vpage_gen + (uint32_t)vmap_gen; }
 static uint64_t next_vbase = VBASE;
 
 static struct nvn_vmap *vmap_find(uint64_t gpu) {
     static _Thread_local struct nvn_vmap *last;
-    static _Thread_local LONG last_gen;
+    static _Thread_local int32_t last_gen;
     struct nvn_vmap *m = last;
     if (m && last_gen == vmap_gen && gpu >= m->gpu && gpu < m->gpu + m->size) return m;
     hos_rwlock_read(&vmap_lock);
@@ -139,7 +152,7 @@ int nvn_gpu_write(uint64_t gpu, const void *src, uint64_t n) {
 }
 
 /* ---- device ---- */
-static volatile LONG depth_minus_w = 1;   /* (OoT's mode from the start: the shaders prepared before the game made its device were
+static volatile int32_t depth_minus_w = 1;   /* (OoT's mode from the start: the shaders prepared before the game made its device were
                                             translated without the depth conversion, and the menu's text and logo fell outside the depth range
                                             on a first start. d3zessete, Hookshot PR 54) */
 
@@ -218,7 +231,7 @@ NV(nvnDeviceSetWindowOriginMode) {
 }
 NV(nvnDeviceSetDepthMode) {
     ((nvn_dev *)P(0))->depth_mode = U32(1);
-    const LONG was = __atomic_exchange_n(&depth_minus_w, U32(1) == NVN_DEPTH_MODE_NEAR_IS_MINUS_W, __ATOMIC_SEQ_CST);
+    const int32_t was = __atomic_exchange_n(&depth_minus_w, U32(1) == NVN_DEPTH_MODE_NEAR_IS_MINUS_W, __ATOMIC_SEQ_CST);
     hos_log("nvn: depth mode %s", U32(1) == NVN_DEPTH_MODE_NEAR_IS_MINUS_W ? "near = -w (GL)" : "near = 0");
     if (was != depth_minus_w)
         hos_log("nvn: the depth mode is not the one the prepared shaders were made for: their vertex stages draw wrong");
@@ -345,14 +358,14 @@ NV(nvnMemoryPoolMapVirtual) {
                in all every 2000) */
             static int log_vmap = -1;
             static uint64_t vmap_from;
-            static volatile LONG logged, total;
+            static volatile int32_t logged, total;
             if (log_vmap < 0) {
                 const char *e = getenv("HOS_NVN_LOG_VMAP");
                 log_vmap = e != NULL;
                 vmap_from = e ? strtoull(e, NULL, 16) : 0;
                 if (vmap_from == 1) vmap_from = 0;
             }
-            const LONG t = __atomic_add_fetch(&total, 1, __ATOMIC_SEQ_CST);
+            const int32_t t = __atomic_add_fetch(&total, 1, __ATOMIC_SEQ_CST);
             if (log_vmap && ((v->gpu >= vmap_from && __atomic_add_fetch(&logged, 1, __ATOMIC_SEQ_CST) <= 3000) || t % 2000 == 0)) {
                 uint64_t nz = 0;   /* (what the physical pages hold as they are mapped) */
                 if (p && p->mem)
@@ -469,7 +482,7 @@ NV(nvnTextureBuilderSetSize2D) {
     b->d.width = U32(1), b->d.height = U32(2), b->d.depth = 1;
     {   /* (hookshot) HOS_SIZE_TRACE=1: who asks for the picture's sizes (the output and the scene: for wider screens) */
         static int on = -1;
-        static volatile LONG left = 24;
+        static volatile int32_t left = 24;
         if (on < 0) on = getenv("HOS_SIZE_TRACE") != NULL;
         const uint32_t w = U32(1);
         if (on && (w == 2560 || w == 2048 || w == 1536 || w == 3840 || w == 1920) && __atomic_sub_fetch(&left, 1, __ATOMIC_SEQ_CST) >= 0) {
@@ -697,40 +710,54 @@ NV(nvnTextureGetViewOffset) {
    next write to them is logged with the writer's call stack (f_XXXXXXXX frames are guest code), then allowed */
 static uintptr_t wts_lo[16], wts_hi[16];
 static int wts_n;
-static volatile LONG wts_reports;
+static volatile int32_t wts_reports;
 void hos_backtrace(void);
-static LONG CALLBACK wts_handler(EXCEPTION_POINTERS *e) {
+#ifdef _WIN32
+static int32_t CALLBACK wts_handler(EXCEPTION_POINTERS *e) {
     if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || e->ExceptionRecord->ExceptionInformation[0] != 1)
-        return EXCEPTION_CONTINUE_SEARCH;
+        return 0;
     const uintptr_t a = (uintptr_t)e->ExceptionRecord->ExceptionInformation[1];
+#else
+static int wts_handler(HosFault *e) {
+    if ((e->signal != SIGSEGV && e->signal != SIGBUS) || !e->write) return 0;
+    const uintptr_t a = e->address;
+#endif
     for (int i = 0; i < wts_n; i++)
         if (a >= wts_lo[i] && a < wts_hi[i]) {
             HosThread *th = hos_self();
             const char *tn = th ? hos_thread_name(th) : "?";
-            static ULONGLONG after = ~0ull;   /* RX_NVN_WATCH_AFTER=<seconds>: only writes after that are reported */
-            if (after == ~0ull) after = GetTickCount64() + (getenv("RX_NVN_WATCH_AFTER") ? (ULONGLONG)atoi(getenv("RX_NVN_WATCH_AFTER")) * 1000 : 0);
+            static uint64_t after = ~0ull;   /* RX_NVN_WATCH_AFTER=<seconds>: only writes after that are reported */
+            if (after == ~0ull) after = ((uint64_t)hos_now_ns() / 1000000) + (getenv("RX_NVN_WATCH_AFTER") ? (uint64_t)atoi(getenv("RX_NVN_WATCH_AFTER")) * 1000 : 0);
             static int all_threads = -1;   /* RX_NVN_WATCH_ALL=1: the Resource Memory thread's writes too */
             if (all_threads < 0) all_threads = getenv("RX_NVN_WATCH_ALL") != NULL;
-            if ((all_threads || strcmp(tn, "Resource Memory")) && GetTickCount64() >= after && __atomic_add_fetch(&wts_reports, 1, __ATOMIC_SEQ_CST) <= 12) {   /* (not the allocation's zero fill) */
+            if ((all_threads || strcmp(tn, "Resource Memory")) && ((uint64_t)hos_now_ns() / 1000000) >= after && __atomic_add_fetch(&wts_reports, 1, __ATOMIC_SEQ_CST) <= 12) {   /* (not the allocation's zero fill) */
                 hos_log("nvn: write to a WriteTexels source at guest %#llx by %s", (unsigned long long)(a - (uintptr_t)GP(0)), tn);
                 hos_backtrace();
             }
+#ifdef _WIN32
             DWORD old;
-            VirtualProtect((void *)(a & ~(uintptr_t)4095), 4096, PAGE_READWRITE, &old);
+            if (!VirtualProtect((void *)(a & ~(uintptr_t)4095), 4096, PAGE_READWRITE, &old)) return 0;
             return EXCEPTION_CONTINUE_EXECUTION;
+#else
+            return mprotect((void *)(a & ~(uintptr_t)4095), 4096, PROT_READ | PROT_WRITE) == 0;
+#endif
         }
-    return EXCEPTION_CONTINUE_SEARCH;
+    return 0;
 }
-static DWORD WINAPI wts_rearm(void *p) {   /* (every 2 ms: the pages a write made writable are watched again) */
+static void wts_rearm(void *p) {   /* (every 2 ms: the pages a write made writable are watched again) */
     (void)p;
     for (int k = 0; k < 300000 && wts_reports < 12; k++) {
-        Sleep(2);
+        hos_sleep_ns(2000000);
         for (int i = 0; i < wts_n; i++) {
+#ifdef _WIN32
             DWORD old;
             VirtualProtect((void *)wts_lo[i], wts_hi[i] - wts_lo[i], PAGE_READONLY, &old);
+#else
+            mprotect((void *)wts_lo[i], wts_hi[i] - wts_lo[i], PROT_READ);
+#endif
         }
     }
-    return 0;
+    return;
 }
 /* (also for other debugging hooks: nn_image_debug.c) the pages of [data, data + size) watched as above */
 void hos_watch_guest_writes(const uint8_t *data, uint64_t size) {
@@ -739,12 +766,19 @@ void hos_watch_guest_writes(const uint8_t *data, uint64_t size) {
     if (wts_n >= 16) return;
     static int handler;
     if (!handler++) {
+#ifdef _WIN32
         AddVectoredExceptionHandler(1, wts_handler);
-        CreateThread(NULL, 0, wts_rearm, NULL, 0, NULL);
+#else
+        hos_fault_add(wts_handler);
+#endif
+        hos_start_worker(wts_rearm, NULL);
     }
     wts_lo[wts_n] = lo, wts_hi[wts_n] = hi, wts_n++;
-    DWORD old;
-    VirtualProtect((void *)lo, hi - lo, PAGE_READONLY, &old);
+#ifdef _WIN32
+    DWORD old; VirtualProtect((void *)lo, hi - lo, PAGE_READONLY, &old);
+#else
+    mprotect((void *)lo, hi - lo, PROT_READ);
+#endif
     hos_log("nvn: watching writes to guest %#llx..%#llx", (unsigned long long)(lo - (uintptr_t)GP(0)),
             (unsigned long long)(hi - (uintptr_t)GP(0)));
 }
@@ -758,12 +792,19 @@ static void watch_texels_source(const nvn_tex *t, const uint8_t *data, uint64_t 
     for (int i = 0; i < wts_n; i++) if (wts_lo[i] == lo) return;
     static int handler;
     if (!handler++) {
+#ifdef _WIN32
         AddVectoredExceptionHandler(1, wts_handler);
-        CreateThread(NULL, 0, wts_rearm, NULL, 0, NULL);
+#else
+        hos_fault_add(wts_handler);
+#endif
+        hos_start_worker(wts_rearm, NULL);
     }
     wts_lo[wts_n] = lo, wts_hi[wts_n] = hi, wts_n++;
-    DWORD old;
-    VirtualProtect((void *)lo, hi - lo, PAGE_READONLY, &old);
+#ifdef _WIN32
+    DWORD old; VirtualProtect((void *)lo, hi - lo, PAGE_READONLY, &old);
+#else
+    mprotect((void *)lo, hi - lo, PROT_READ);
+#endif
     hos_log("nvn: watching WriteTexels source guest %#llx..%#llx", (unsigned long long)(lo - (uintptr_t)GP(0)),
             (unsigned long long)(hi - (uintptr_t)GP(0)));
 }
@@ -869,13 +910,12 @@ static void dump_stage(uint64_t code, uint64_t ctl) {
     static const char *dir = (const char *)-1;
     if (dir == (const char *)-1) dir = getenv("HOS_SHADER_DUMP");
     if (!dir || !code || !ctl) return;
-    char path[MAX_PATH];
+    char path[HOS_PATH_MAX];
     snprintf(path, sizeof path, "%s/%010llx.code", dir, (unsigned long long)code);
-    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return;
-    CreateDirectoryA(dir, NULL);
+    if (fs_type(path) >= 0) return;
+    fs_mkdir(dir);
     uint64_t n = 0;
-    MEMORY_BASIC_INFORMATION mbi;
-    while (n < 0x10000 && VirtualQuery(GP(code + n), &mbi, sizeof mbi) && mbi.State == MEM_COMMIT) n += 0x1000;
+    while (n < 0x10000 && hos_memory_readable(GP(code + n), 0x1000)) n += 0x1000;
     FILE *f = fopen(path, "wb");
     if (f) { fwrite(GP(code), 1, (size_t)n, f); fclose(f); }
     snprintf(path, sizeof path, "%s/%010llx.ctl", dir, (unsigned long long)code);
@@ -914,8 +954,8 @@ volatile int hos_nvn_sync_log_on;   /* (also the live input file's "!synclog": n
 static int sync_log(void) {   /* (the first 30000 calls; HOS_NVN_SYNC_LOG=<n>: from the n-th present on, 400 calls) */
     static int v = -1;
     static long long from;
-    static volatile LONG n;
-    extern volatile LONG64 hos_present_count;   /* display.c */
+    static volatile int32_t n;
+    extern volatile int64_t hos_present_count;   /* display.c */
     if (v < 0) v = getenv("HOS_NVN_SYNC_LOG") != NULL, from = v ? atoll(getenv("HOS_NVN_SYNC_LOG")) : 0;
     if (v && from > 1) return hos_present_count >= from && __atomic_add_fetch(&n, 1, __ATOMIC_SEQ_CST) <= 400;
     return (v || hos_nvn_sync_log_on) && __atomic_add_fetch(&n, 1, __ATOMIC_SEQ_CST) <= 30000;
@@ -928,7 +968,7 @@ static int sync_log(void) {   /* (the first 30000 calls; HOS_NVN_SYNC_LOG=<n>: f
    default; HOS_NVN_HOLD=1: held. */
 typedef struct { int n; uint64_t h[64]; } held_submit;
 static held_submit held[256];
-static volatile LONG nheld;
+static volatile int32_t nheld;
 static HosRecursiveMutex held_cs = HOS_RECURSIVE_MUTEX_INIT;
 static int hold_on = -1;
 static void held_init(void) {
@@ -938,7 +978,7 @@ static void held_flush(void) {
     held_init();
     if (!nheld) return;
     hos_recursive_lock(&held_cs);
-    for (LONG i = 0; i < nheld; i++) rx_nvn_submit(held[i].h, held[i].n);
+    for (int32_t i = 0; i < nheld; i++) rx_nvn_submit(held[i].h, held[i].n);
     nheld = 0;
     hos_recursive_unlock(&held_cs);
 }
@@ -950,11 +990,11 @@ NV(nvnQueueFenceSync) {
     if (sync_log()) hos_log("nvn: FenceSync %p -> %llu (lr %#llx)", (void *)s, (unsigned long long)s->fence, (unsigned long long)c->x[30]);
 }
 /* (the GPU waits the game makes: count and time by kind, logged every 5 s) */
-static volatile LONG64 wait_ns[3], wait_n[3];   /* sync waits that blocked, sync polls that timed out, queue finishes */
+static volatile int64_t wait_ns[3], wait_n[3];   /* sync waits that blocked, sync polls that timed out, queue finishes */
 static void wait_note(int kind, int64_t t0) {
     __atomic_add_fetch(&wait_ns[kind], hos_now_ns() - t0, __ATOMIC_SEQ_CST);
     __atomic_add_fetch(&wait_n[kind], 1, __ATOMIC_SEQ_CST);
-    static volatile LONG64 last;
+    static volatile int64_t last;
     const int64_t now = hos_now_ns(), l = last;
     if (now - l >= 5000000000LL && HOS_ATOMIC_CAS(&last, now, l) == l && l) {
         hos_log("nvn: GPU waits in 5 s: %lld sync waits (%.0f ms), %lld polls timed out (%.0f ms), %lld queue finishes (%.0f ms)",
@@ -1016,8 +1056,8 @@ NV(nvnEventGetValue) {
 NV(nvnEventSignal) {
     const nvn_event *e = (const nvn_event *)P(0);
     {   /* (the CPU's signals, 40 then every 5000: what the GPU's waits above wait for) */
-        static volatile LONG n;
-        const LONG k = __atomic_add_fetch(&n, 1, __ATOMIC_SEQ_CST);
+        static volatile int32_t n;
+        const int32_t k = __atomic_add_fetch(&n, 1, __ATOMIC_SEQ_CST);
         if (k <= 40 || k % 5000 == 0)
             hos_log("nvn: EventSignal (CPU) #%ld: event %#llx mode %u value %u (lr %#llx)", (long)k,
                     (unsigned long long)(e ? e->gpu : 0), U32(1), U32(2), (unsigned long long)c->x[30]);
@@ -1124,11 +1164,11 @@ NV(nvnCommandBufferInitialize) {
     o->inline_end = 0;
     RET(1);
 }
-static volatile LONG64 seg_bytes, seg_count;   /* (the command buffers' segments, for the recordings' log line) */
+static volatile int64_t seg_bytes, seg_count;   /* (the command buffers' segments, for the recordings' log line) */
 NV(nvnCommandBufferFinalize) {
     nvn_cmd *o = CB(P(0));
     if (o->seg) {
-        __atomic_add_fetch(&seg_bytes, -(LONG64)(o->end - o->seg), __ATOMIC_SEQ_CST);
+        __atomic_add_fetch(&seg_bytes, -(int64_t)(o->end - o->seg), __ATOMIC_SEQ_CST);
         __atomic_sub_fetch(&seg_count, 1, __ATOMIC_SEQ_CST);
     }
     if (o->seg) pool_put(o->seg, pool_off() ? POOL_MAX + 1 : pool_class((size_t)(o->end - o->seg)));
@@ -1155,12 +1195,12 @@ static void cmd_reserve(nvn_cmd *o, size_t need) {
     if (!b) die("recording buffer (%zu bytes)", cap);
     if (o->seg) {
         memcpy(b, o->seg, used);
-        __atomic_add_fetch(&seg_bytes, -(LONG64)(o->end - o->seg), __ATOMIC_SEQ_CST);
+        __atomic_add_fetch(&seg_bytes, -(int64_t)(o->end - o->seg), __ATOMIC_SEQ_CST);
         pool_put(o->seg, pool_off() ? POOL_MAX + 1 : pool_class((size_t)(o->end - o->seg)));
     } else {
         __atomic_add_fetch(&seg_count, 1, __ATOMIC_SEQ_CST);
     }
-    __atomic_add_fetch(&seg_bytes, (LONG64)cap, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&seg_bytes, (int64_t)cap, __ATOMIC_SEQ_CST);
     o->seg = b, o->cur = b + used, o->end = b + cap;
 }
 static uint8_t *cmd_alloc(nvn_cmd *o, uint32_t size) {
@@ -1200,7 +1240,7 @@ static size_t npins;   /* (tex_copy: the texture copies, logged with the recordi
 static unsigned rec_shift = 16;   /* (set when the buckets are made) */
 static unsigned rec_bucket(uint64_t ctl) { return (unsigned)(((ctl >> rec_shift) * 0x9E3779B97F4A7C15ull) >> 48) & (REC_BUCKETS - 1); }
 static HosMutex copy_lock = HOS_MUTEX_INIT;
-static volatile LONG64 copy_bytes;
+static volatile int64_t copy_bytes;
 #define COPY_MAGIC 0x59504f43444d43ull   /* "CMDCOPY" */
 typedef struct { uint64_t magic, bytes, cls; } copy_prefix;   /* (cls: its pool class) */
 /* released copies wait until the replay passed every submit made before their release (the replay runs behind) */
@@ -1211,7 +1251,7 @@ static void free_dead_copies(void) {   /* (copy_lock held) */
     const uint64_t done = rx_nvn_replayed();
     for (size_t i = 0; i < ndead;) {
         if (dead[i].after <= done) {
-            __atomic_add_fetch(&copy_bytes, -(LONG64)dead[i].p->bytes, __ATOMIC_SEQ_CST);
+            __atomic_add_fetch(&copy_bytes, -(int64_t)dead[i].p->bytes, __ATOMIC_SEQ_CST);
             pool_put(dead[i].p, (unsigned)dead[i].p->cls);
             dead[i] = dead[--ndead];
         } else {
@@ -1330,7 +1370,7 @@ static uint8_t *flatten(const uint8_t *p, size_t n) {
     pre->cls = cls;
     pre->magic = COPY_MAGIC;
     pre->bytes = sizeof(copy_prefix) + n;
-    __atomic_add_fetch(&copy_bytes, (LONG64)pre->bytes, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&copy_bytes, (int64_t)pre->bytes, __ATOMIC_SEQ_CST);
     return out + sizeof(copy_prefix);
 }
 /* (the watches below) the guest's call chain, by frame pointers: "lr < caller < ..." */
@@ -1345,7 +1385,7 @@ static void *watch_draw_cmd;
 static uint64_t watch_handles[16];
 static int nwatch_handles;
 static void watch_handle_called(Ctx *c, uint64_t h, const char *how) {
-    static volatile LONG logged;
+    static volatile int32_t logged;
     for (int i = 0; i < nwatch_handles; i++) {
         if (watch_handles[i] != h || __atomic_add_fetch(&logged, 1, __ATOMIC_SEQ_CST) > 60) continue;
         char b[400];
@@ -1444,8 +1484,8 @@ static void *rec(nvn_cmd *o, uint32_t op, size_t payload) {
 
 NV(nvnCommandBufferSignalEvent) {
     {   /* (the GPU's signals as recorded, 40 then every 5000) */
-        static volatile LONG n;
-        const LONG k = __atomic_add_fetch(&n, 1, __ATOMIC_SEQ_CST);
+        static volatile int32_t n;
+        const int32_t k = __atomic_add_fetch(&n, 1, __ATOMIC_SEQ_CST);
         if (k <= 40 || k % 5000 == 0)
             hos_log("nvn: CommandBufferSignalEvent #%ld: event %#llx mode %u value %u (lr %#llx)", (long)k,
                     (unsigned long long)((const nvn_event *)P(1))->gpu, U32(2), U32(5), (unsigned long long)c->x[30]);
@@ -1459,8 +1499,8 @@ NV(nvnCommandBufferSignalEvent) {
    event goes on once that queue's work has signalled it (vk_replay.cpp, submit_job). MK World's worker queue and its
    presentation queue pass stages back and forth this way several times a frame. (Logged, 40 calls then every 5000) */
 NV(nvnCommandBufferWaitEvent) {
-    static volatile LONG n;
-    const LONG k = __atomic_add_fetch(&n, 1, __ATOMIC_SEQ_CST);
+    static volatile int32_t n;
+    const int32_t k = __atomic_add_fetch(&n, 1, __ATOMIC_SEQ_CST);
     const nvn_event *e = (const nvn_event *)P(1);
     if (k <= 40 || k % 5000 == 0) {
         uint32_t now = 0;
@@ -1473,8 +1513,8 @@ NV(nvnCommandBufferWaitEvent) {
     w->gpu = e->gpu, w->mode = U32(2), w->value = U32(3);
 }
 NV(nvnCommandBufferWaitSync) {
-    static volatile LONG n;
-    const LONG k = __atomic_add_fetch(&n, 1, __ATOMIC_SEQ_CST);
+    static volatile int32_t n;
+    const int32_t k = __atomic_add_fetch(&n, 1, __ATOMIC_SEQ_CST);
     if (k <= 40 || k % 5000 == 0) hos_log("nvn: CommandBufferWaitSync #%ld (lr %#llx)", (long)k, (unsigned long long)c->x[30]);
 }
 /* (hookshot) nvnCommandBufferPushComputeConstants(cmdbuf, int ?, offset, size, const void* data): compute push
@@ -1497,7 +1537,7 @@ NV(nvnCommandBufferPushComputeConstants) {
    fenced yet (a wait on a fence another queue submits later) cannot be honored that way and is logged. */
 NV(nvnQueueWaitSync) {
     const nvn_sync *s = (const nvn_sync *)P(1);
-    static volatile LONG n;
+    static volatile int32_t n;
     if (s && !s->fenced && __atomic_add_fetch(&n, 1, __ATOMIC_SEQ_CST) <= 8)
         hos_log("nvn: QueueWaitSync on a sync not fenced yet (%p, lr %#llx): not waited for", (void *)s,
                 (unsigned long long)c->x[30]);
@@ -1517,7 +1557,7 @@ NV(nvnCommandBufferReportCounter) {
     nvn_p_counter *r = REC(CB(P(0)), NOP_REPORT_COUNTER, nvn_p_counter);
     r->type = U32(1);
     {   /* (which counters the game reads: the first report of each type, with its caller) */
-        static volatile LONG seen[64];
+        static volatile int32_t seen[64];
         if (U32(1) < 64 && !__atomic_exchange_n(&seen[U32(1)], 1, __ATOMIC_SEQ_CST))
             hos_log("nvn: the game reports counter type %u (lr %#llx)", U32(1), (unsigned long long)c->x[30]);
     }
@@ -1811,7 +1851,7 @@ NV(nvnCommandBufferDrawArraysInstanced) {
 static void watch_draw(Ctx *c, int count) {
     static int want = -1;
     static int64_t after;
-    static volatile LONG logged;
+    static volatile int32_t logged;
     if (want < 0) {   /* (<count>,<after s>: from that much time on) */
         const char *e = getenv("HOS_NVN_WATCH_DRAW");
         want = e ? atoi(e) : 0;
@@ -1908,7 +1948,7 @@ NV(nvnCommandBufferCopyBufferToTexture) {
         static int on = -1;
         if (on < 0) on = getenv("RX_VK_LOG_B2T") != NULL;
         static uint64_t seen[16];
-        static volatile LONG nseen;
+        static volatile int32_t nseen;
         int k;
         for (k = 0; k < nseen && seen[k] != r->buf; k++) {}
         if (on && r->r.width >= 960 && k == nseen && nseen < 16) {
@@ -2022,7 +2062,7 @@ NV(nvnChannelMaskStateSetChannelMask) {
     static int chmask_log = -1;   /* (asked once: getenv on every call was 15% of the render thread) */
     if (chmask_log < 0) chmask_log = getenv("HOS_NVN_CHMASK_LOG") != NULL;
     if (chmask_log) {   /* (debugging: NVN2's arguments) */
-        static volatile LONG n;
+        static volatile int32_t n;
         if (__atomic_add_fetch(&n, 1, __ATOMIC_SEQ_CST) <= 40)
             hos_log("nvn: SetChannelMask(%#llx, %#llx, %#llx, %#llx, %#llx, %#llx) lr %#llx", (unsigned long long)c->x[0],
                     (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[3],
@@ -2102,7 +2142,7 @@ static void resolve_deferred(uint8_t *p) {
     }
 }
 NV(nvnQueueSubmitCommands) {
-    { void hos_renderer_wait(void); static volatile LONG up; if (!up) { hos_renderer_wait(); up = 1; } }   /* (display.c) */
+    { void hos_renderer_wait(void); static volatile int32_t up; if (!up) { hos_renderer_wait(); up = 1; } }   /* (display.c) */
     nvn_queue *q = (nvn_queue *)P(0);
     const int n = I(1);
     uint64_t h[64];
@@ -2110,8 +2150,8 @@ NV(nvnQueueSubmitCommands) {
     memcpy(h, P(2), 8 * (size_t)n);
     q->submits++;
     {   /* (which queues submit, 60 lines then every 20000: the game's queues are replayed on one, in arrival order) */
-        static volatile LONG k;
-        const LONG i = __atomic_add_fetch(&k, 1, __ATOMIC_SEQ_CST);
+        static volatile int32_t k;
+        const int32_t i = __atomic_add_fetch(&k, 1, __ATOMIC_SEQ_CST);
         if (i <= 60 || i % 20000 == 0)
             hos_log("nvn: QueueSubmitCommands #%ld: queue %p (its #%llu), %d handles (lr %#llx)", (long)i, (void *)q,
                     (unsigned long long)q->submits, n, (unsigned long long)c->x[30]);
@@ -2123,8 +2163,8 @@ NV(nvnQueueSubmitCommands) {
     held_init();
     if (!hold_on) { rx_nvn_submit_q(h, n, (uint64_t)(uintptr_t)q); return; }
     hos_recursive_lock(&held_cs);
-    if (nheld == (LONG)(sizeof held / sizeof *held)) {   /* (full: what is held goes now) */
-        for (LONG i = 0; i < nheld; i++) rx_nvn_submit(held[i].h, held[i].n);
+    if (nheld == (int32_t)(sizeof held / sizeof *held)) {   /* (full: what is held goes now) */
+        for (int32_t i = 0; i < nheld; i++) rx_nvn_submit(held[i].h, held[i].n);
         nheld = 0;
     }
     held[nheld].n = n;
@@ -2226,7 +2266,7 @@ NV(nvnQueuePresentTexture) {
         if (away) hos_vcore_back();
     }
     o->presents++;
-    extern volatile LONG64 hos_present_count;   /* display.c */
+    extern volatile int64_t hos_present_count;   /* display.c */
     __atomic_add_fetch(&hos_present_count, 1, __ATOMIC_SEQ_CST);
     hos_vi_native_presented();
 }
@@ -2393,8 +2433,8 @@ static void draw_mesh(Ctx *c, int kind) {
     if (kind == 0) r->x = I(1), r->y = I(2), r->z = I(3);
     else if (kind == 1) r->indirect = U64(1), r->max = 1;
     else r->indirect = U64(1), r->count_addr = U64(2), r->max = I(3), r->stride = I(4);
-    static volatile LONG64 n;
-    const LONG64 k = __atomic_add_fetch(&n, 1, __ATOMIC_SEQ_CST);
+    static volatile int64_t n;
+    const int64_t k = __atomic_add_fetch(&n, 1, __ATOMIC_SEQ_CST);
     if (k <= 3 || k % 20000 == 0)
         hos_log("nvn: DrawMeshTasks%s: %lld so far (x1 %#llx x2 %#llx x3 %#llx x4 %#llx)",
                 kind == 0 ? "" : kind == 1 ? "Indirect" : " (multi, indirect count)", (long long)k,
@@ -2857,10 +2897,10 @@ static void unimplemented(Ctx *c, void *name) {
         die("NVN %s is not implemented (x0 %#llx x1 %#llx x2 %#llx)", (const char *)name, (unsigned long long)c->x[0],
             (unsigned long long)c->x[1], (unsigned long long)c->x[2]);
     static struct { const char *name; } seen[512];
-    static volatile LONG nseen;
+    static volatile int32_t nseen;
     static HosMutex lock = HOS_MUTEX_INIT;
     hos_mutex_lock(&lock);
-    LONG i;
+    int32_t i;
     for (i = 0; i < nseen && seen[i].name != name; i++) {}
     if (i == nseen && nseen < 512) {
         seen[nseen++].name = (const char *)name;
@@ -2899,7 +2939,7 @@ uint64_t nvn_native_proc(const char *name) {
         for (k = 0; k < nun && strcmp(un[k].name, name); k++) {}
         if (k == nun) {
             un = realloc(un, (nun + 1) * sizeof *un);
-            un[nun].name = _strdup(name);
+            un[nun].name = fs_strdup(name);
             un[nun].a = hos_hostcall(un[nun].name, unimplemented, un[nun].name);
             nun++;
         }

@@ -3,8 +3,7 @@
    HOS_WINDOW_SIZE=<w>x<h>, HOS_FULLSCREEN=1, HOS_WINDOW_NOACTIVATE=1; F11 fullscreen; a click captures the mouse
    (relative motion, read by nn_hid.c), Esc or leaving the window releases it; closing the window ends the run.
 
-   It also answers the window calls of host/linux/windows.h: GetAsyncKeyState (the keyboard as SDL last saw it),
-   GetForegroundWindow (the game's window while it has the keyboard), GetClientRect, GetSystemMetrics. */
+   Keyboard and focus queries use the native host input interface. */
 #include "hos.h"
 #include "hos_sync.h"
 #include "hos_platform.h"
@@ -13,7 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <windows.h>
+
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include "../../gpu/render/rx.h"
@@ -29,6 +28,7 @@ void hos_sdl_identity(void) {
     pthread_once(&once, sdl_set_identity);
 }
 static SDL_Window *window;
+int hos_linux_has_focus(void) { return window && SDL_GetKeyboardFocus() == window; }
 static int renderer;
 
 static volatile int32_t mouse_dx, mouse_dy, mouse_captured;
@@ -200,26 +200,6 @@ void hos_display_start(void) {
     if (!renderer_started) { rx_start(NULL); renderer_signal(); }
 }
 
-/* ---- host/linux/windows.h's window calls ---- */
-int hos_linux_has_focus(void) { return window && SDL_GetKeyboardFocus() == window; }
-HWND GetForegroundWindow(void) { return hos_linux_has_focus() ? (HWND)window : NULL; }
-DWORD GetWindowThreadProcessId(HWND w, DWORD *pid) {
-    if (pid) *pid = w ? (DWORD)getpid() : 0;
-    return w ? 1 : 0;
-}
-LONG_PTR GetWindowLongPtrA(HWND w, int index) { (void)w, (void)index; return 0; }
-int GetClassNameA(HWND w, LPSTR out, int cap) {
-    if (cap <= 0) return 0;
-    snprintf(out, (size_t)cap, "%s", w ? "Hookshot" : "");
-    return (int)strlen(out);
-}
-BOOL GetClientRect(HWND w, RECT *r) {
-    int x = 0, y = 0;
-    if (w) SDL_GetWindowSizeInPixels((SDL_Window *)w, &x, &y);
-    r->left = r->top = 0;
-    r->right = x, r->bottom = y;
-    return w != NULL;
-}
 /* (the screen's size once the window's thread started SDL's video: before that, as for hos_main.c's ultrawide
    check, 0, read as "not known") */
 /* (the boot's ultrawide check asks before the display thread has started SDL's video: started here then, once, and
@@ -234,13 +214,6 @@ void hos_linux_screen_size(int *width, int *height) {
     *width = m ? m->w : 0;
     *height = m ? m->h : 0;
 }
-int GetSystemMetrics(int index) {
-    int width, height;
-    hos_linux_screen_size(&width, &height);
-    return index == SM_CXSCREEN ? width : index == SM_CYSCREEN ? height : 0;
-}
-
-
 static SDL_Scancode scancode_of(int vk) {
     if (vk >= 'A' && vk <= 'Z') return (SDL_Scancode)(SDL_SCANCODE_A + (vk - 'A'));
     if (vk >= '1' && vk <= '9') return (SDL_Scancode)(SDL_SCANCODE_1 + (vk - '1'));
@@ -311,5 +284,3 @@ int hos_linux_key_down(int vk) {
     }
     return down;
 }
-
-short GetAsyncKeyState(int vk) { return hos_linux_key_down(vk) ? (short)0x8000 : 0; }

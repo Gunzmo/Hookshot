@@ -6,6 +6,10 @@ on:
     paths:
       - host/**
       - tests/test_host*
+      - tests/test_fault_linux.c
+      - gpu/vk/**
+      - nx2/build.py
+      - nx2/target.py
       - nx2/kit.py
       - nx2/rtgen.py
       - third_party/a64-kit/rt/a64.h
@@ -22,6 +26,10 @@ on:
     paths:
       - host/**
       - tests/test_host*
+      - tests/test_fault_linux.c
+      - gpu/vk/**
+      - nx2/build.py
+      - nx2/target.py
       - nx2/kit.py
       - nx2/rtgen.py
       - third_party/a64-kit/rt/a64.h

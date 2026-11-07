@@ -44,8 +44,7 @@ import toolchain
 
 NX2_RT = os.path.join(kit.HERE, "rt")
 HOST = os.path.join(kit.HERE, "..", "host")
-# (hookshot) Linux: host/linux/ is on the include path (its windows.h: the Win32 that host/ and gpu/vk use) and its
-# .c files take the place of the Windows-only ones
+# Native Linux display and diagnostics replace the Windows-only host sources.
 HOST_LINUX = os.path.join(HOST, "linux")
 WINDOWS_ONLY = ("display.c", "mf_av1.c")
 
@@ -55,7 +54,7 @@ def host_sources():
     srcs = [os.path.join(HOST, f) for f in os.listdir(HOST) if f.endswith(".c") and (f != "pgo_rt.c" or PGO == "gen")]
     if not target.windows():
         srcs = [s for s in srcs if os.path.basename(s) not in WINDOWS_ONLY] + \
-               [os.path.join(HOST_LINUX, f) for f in os.listdir(HOST_LINUX) if f.endswith(".c")]
+               [os.path.join(HOST_LINUX, f) for f in os.listdir(HOST_LINUX) if f.endswith(".c") and f != "win32.c"]
     return sorted(srcs)
 
 
@@ -423,7 +422,7 @@ def main():
     host_deps = deps + b"".join(open(os.path.join(HOST, f), "rb").read() for f in sorted(os.listdir(HOST))
                                 if f.endswith(".h"))
     if not target.windows():   # (hookshot) host/linux: its windows.h first, SDL3's headers (the system's)
-        host_fl = ["-I" + HOST_LINUX] + host_fl + ["-D_GNU_SOURCE"] + sdl3_cflags()
+        host_fl = host_fl + ["-D_GNU_SOURCE"] + sdl3_cflags()
         host_deps += b"".join(open(os.path.join(HOST_LINUX, f), "rb").read() for f in sorted(os.listdir(HOST_LINUX))
                               if f.endswith(".h"))
         for fl in sdl3_cflags() or ["-I/usr/include"]:   # (and SDL's version: its headers are not ours either)
@@ -482,8 +481,8 @@ def main():
         for f in sorted(translator) + [os.path.join(vk, n) for n in ("vk_shader.cpp", "vk_state.h", "vk_api.h")]:
             with open(f, "rb") as src:
                 stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
-        # (hookshot) Linux: host/linux's windows.h, FreeType's headers for the Insert menu's text (gpu/vk/vk_gdi_linux.h)
-        linux_vk = [] if target.windows() else ["-fPIC", "-I" + HOST_LINUX] + (pkg_cflags("freetype2") or ["-DVK_GDI_NO_FREETYPE"]) + \
+        # FreeType headers for the native Linux menu rasterizer.
+        linux_vk = [] if target.windows() else ["-fPIC"] + (pkg_cflags("freetype2") or ["-DVK_GDI_NO_FREETYPE"]) + \
             libcxx_cflags()
         vflags = target.compile_flags() + CPU + linux_vk + [   # (hookshot: the replay is the frame's limit now)
             "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16],
@@ -507,7 +506,7 @@ def main():
                                    os.path.join(GPU, "compat"))
         vdeps = tree_headers(vk, os.path.join(GPU, "render"), os.path.join(GPU, "compat"),
                              os.path.join(GPU, "third_party", "suyu", "video_core", "textures")) + \
-            (b"" if target.windows() else tree_headers(HOST_LINUX))
+            (b"" if target.windows() else tree_headers(HOST))
         for src in vk_sources():
             name = os.path.relpath(src, vk).replace(os.sep, "_")[:-4]
             lib = os.path.relpath(src, vk).split(os.sep)[0] in ("eden", "sirit")

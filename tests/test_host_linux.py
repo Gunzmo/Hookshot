@@ -30,6 +30,10 @@ with tempfile.TemporaryDirectory(prefix="hookshot-host-test-") as temp:
     subprocess.run(flags + [str(ROOT / "tests/test_host_boot_linux.c"),
                            str(ROOT / "host/hos_platform.c"), "-o", str(boot)], check=True)
     subprocess.run([str(boot)], env=env, timeout=30, check=True)
+    fault = pathlib.Path(temp, "test_fault")
+    subprocess.run(flags + [str(ROOT / "tests/test_fault_linux.c"),
+                           str(ROOT / "host/hos_fault.c"), "-o", str(fault)], check=True)
+    subprocess.run([str(fault)], env=env, timeout=30, check=True)
     if "--core-only" in sys.argv:
         raise SystemExit(0)
     sdl = shlex.split(subprocess.check_output(["pkg-config", "--cflags", "--libs", "sdl3"], text=True))

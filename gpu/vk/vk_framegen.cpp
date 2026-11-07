@@ -1,3 +1,4 @@
+#include "vk_platform.h"
 // Frame interpolation (RX_VK_FRAMEGEN=1; off by default): frames made between the game's, from its last two, shown in
 // between by a display thread, so a game at 60 fps is shown at 120 (RX_VK_FRAMEGEN_MULT=3: 180). The WebGPU
 // renderer's (gpu/render/rx_framegen.cpp, whose comments explain it), on Vulkan:
@@ -242,8 +243,8 @@ void pass(VkCommandBuffer cmd, const Pipe& p, std::initializer_list<std::pair<Vk
 }
 
 void display_main() {
-    SetThreadDescription(GetCurrentThread(), L"mkw_vk display");
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    vk_platform::name(L"mkw_vk display");
+    vk_platform::priority(1);
     int64_t interval = 16666667, last_at = 0;
     struct { int on_time, late, skipped; int64_t since; } stat{};
     int64_t next_show = 0, shown_at = 0;
@@ -283,7 +284,7 @@ void display_main() {
             if (due - now > 1000000) {
                 std::this_thread::sleep_for(std::chrono::nanoseconds(due - now - 1000000));
             }
-            while (now_ns() < due) SwitchToThread();
+            while (now_ns() < due) vk_platform::yield();
             const int64_t t = now_ns();
             present_kind.store(k < j.set->made ? 1 : 0);
             present_image(j.set->frame[k].image, fg.w, fg.h, nullptr, j.set->frame[k].view);

@@ -1,3 +1,4 @@
+#include "vk_platform.h"
 // The Vulkan back end's start: vulkan-1.dll, the instance, the device (Vulkan 1.3 and the extensions the NVN replay
 // wants where the GPU has them: mesh shaders, host memory import, graphics pipeline libraries), the window's
 // swapchain, and the rx_* table (vk_api.h). The NVN replay itself is vk_replay.cpp.
@@ -28,9 +29,17 @@ VKX_DEVICE3(VKX_DEFINE)
 static PFN_vkGetInstanceProcAddr get_instance_proc;
 
 bool load_global() {
+#ifdef _WIN32
     HMODULE m = LoadLibraryA("vulkan-1.dll");
+#else
+    void *m = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+#endif
     if (!m) return false;
+#ifdef _WIN32
     get_instance_proc = (PFN_vkGetInstanceProcAddr)(void*)GetProcAddress(m, "vkGetInstanceProcAddr");
+#else
+    get_instance_proc = (PFN_vkGetInstanceProcAddr)dlsym(m, "vkGetInstanceProcAddr");
+#endif
     if (!get_instance_proc) return false;
 #define VKX_LOAD(f) f = (PFN_##f)get_instance_proc(nullptr, #f);
     VKX_GLOBAL(VKX_LOAD)
@@ -368,19 +377,19 @@ bool create_swapchain(uint32_t width, uint32_t height) {
 
 namespace {
 
-HWND main_window = nullptr;
+AppWindow main_window = nullptr;
 // (hookshot) hookshot_rt --prepare-shaders (the launcher, after a build): the same work with no game, its progress as
 // "@@progress" lines on stdout. A skip there leaves hookshot_prepare_skipped beside the runtime: the game's own starts then
 // leave the work out too (what was not prepared is built when first drawn), until a --prepare-shaders run ends it
 bool prepare_only() { return getenv("HOOKSHOT_PREPARE_ONLY") != nullptr; }
 std::string skipped_path() {
-    char exe[MAX_PATH];
-    const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    char exe[4096];
+    const uint32_t n = vk_platform::executable(exe, sizeof exe);
     std::string path(exe, n);
     return path.substr(0, path.find_last_of("\\/") + 1) + "hookshot_prepare_skipped";
 }
 bool started_up() {
-    if (const char* e = getenv("RX_VK_START_DELAY")) Sleep((DWORD)atoi(e) * 1000);   // (diagnosis: a long start, as the first one is)
+    if (const char* e = getenv("RX_VK_START_DELAY")) vk_platform::sleep((unsigned)atoi(e) * 1000);   // (diagnosis: a long start, as the first one is)
     if (!replay_start()) return false;
     if (prepare_only()) {
         static int part;   // (two parts: the programs, then the pipelines the notes name; most of the time is the first)
@@ -409,10 +418,13 @@ bool started_up() {
     }
     if (precompile_wanted()) {   // (a release build, before the game: nothing to build during play)
         // (a console while it lasts: there is no window yet, and a long wait with nothing on screen looks like a hang)
+#ifdef _WIN32
         static HANDLE console = nullptr;
+#endif
         const auto progress = [](size_t done, size_t total) {
-            static bool tried = false;
             if (!total) return;
+#ifdef _WIN32
+            static bool tried = false;
             if (!tried) {
                 tried = true;
                 if (AllocConsole()) {
@@ -422,22 +434,26 @@ bool started_up() {
                 }
             }
             char line[80];
-#ifndef _WIN32   // (hookshot) Linux: on the terminal it was started from, if any
+#else   // (hookshot) Linux: on the terminal it was started from, if any
             if (isatty(2)) fprintf(stderr, "\rPreparing shaders: %zu of %zu (%zu%%)   %s", done, total, done * 100 / total, done == total ? "\n" : "");
 #endif
+#ifdef _WIN32
             if (!console) return;
             const int n = snprintf(line, sizeof line, "%cPreparing shaders: %zu of %zu (%zu%%)   ", 13, done, total, done * 100 / total);
             DWORD wrote = 0;
             WriteFile(console, line, (DWORD)n, &wrote, nullptr);
+#endif
         };
         prepare_run(progress);
         precompile_run(progress);
+#ifdef _WIN32
         if (console) CloseHandle(console), console = nullptr, FreeConsole();
+#endif
     }
     return true;
 }
 int start(void* hwnd) {
-    main_window = (HWND)hwnd;
+    main_window = (AppWindow)hwnd;
     if (!hwnd) {   // (HOS_HEADLESS: no window; the frames are rendered all the same, RX_VK_SHOTS writes them out)
         dev.offscreen = true;
         dev.swap_extent = {1920, 1080};
@@ -448,10 +464,10 @@ int start(void* hwnd) {
 #ifdef _WIN32
     VkWin32SurfaceCreateInfoKHR si{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
     si.hinstance = GetModuleHandleA(nullptr);
-    si.hwnd = (HWND)hwnd;
+    si.hwnd = (AppWindow)hwnd;
     if (vkCreateWin32SurfaceKHR(dev.instance, &si, nullptr, &dev.surface) != VK_SUCCESS) return 0;
     RECT r{};
-    GetClientRect((HWND)hwnd, &r);
+    GetClientRect((AppWindow)hwnd, &r);
     const int width = r.right - r.left, height = r.bottom - r.top;
 #else   // (hookshot) Linux: the window's toolkit makes the surface (host/linux/display_sdl.c)
     const HosLinuxWindow* w = (const HosLinuxWindow*)hwnd;
@@ -508,5 +524,5 @@ extern "C" MKWVK_EXPORT const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
 }
 
 namespace mkwvk {
-HWND app_window() { return main_window; }   // (hookshot: the Insert menu's Fullscreen row)
+AppWindow app_window() { return main_window; }   // (hookshot: the Insert menu's Fullscreen row)
 } // namespace mkwvk

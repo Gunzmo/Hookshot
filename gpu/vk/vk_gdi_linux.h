@@ -16,6 +16,12 @@
 #include FT_FREETYPE_H
 #endif
 
+#include <cstdint>
+using BOOL = int;
+#define TRUE 1
+using LONG = int32_t; using DWORD = uint32_t; using WORD = uint16_t; using UINT = unsigned;
+using LPCSTR = const char*; using HANDLE = void*;
+struct RECT { int left, top, right, bottom; };
 typedef uint32_t COLORREF;
 #define RGB(r, g, b) ((COLORREF)(((uint32_t)(uint8_t)(r)) | ((uint32_t)(uint8_t)(g) << 8) | ((uint32_t)(uint8_t)(b) << 16)))
 struct SIZE { LONG cx, cy; };

@@ -12,7 +12,7 @@
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "vk_platform.h"
 
 #include "vk_internal.h"
 #include "vk_state.h"
@@ -93,11 +93,15 @@ const void* descriptor_ok(const void* p, size_t n) {
     uint64_t avail = 0;
     if (const uint8_t* h = host->gpu_ptr((uint64_t)q, &avail); h && avail >= n) return h;
     // (the host's own copies: registrations made before the renderer started, kept by host/rx_backend.c)
+#ifndef _WIN32
+    if (hos_memory_readable(p, n)) return p;
+#else
     MEMORY_BASIC_INFORMATION mi{};
     if (VirtualQuery(p, &mi, sizeof mi) == sizeof mi && mi.State == MEM_COMMIT &&
         (mi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY)) && !(mi.Protect & PAGE_GUARD) &&
         q + n <= (uintptr_t)mi.BaseAddress + mi.RegionSize)
         return p;
+#endif
     static int logged;
     if (logged++ < 8) logf("vk: descriptor outside guest memory: refused");
     return nullptr;

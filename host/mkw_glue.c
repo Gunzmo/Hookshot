@@ -6,7 +6,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>   /* (Linux: host/linux/windows.h) */
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include "hos_fault.h"
+#include <signal.h>
+#endif
 #ifndef _WIN32
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -21,14 +26,16 @@ void hos_commit(uint64_t addr, uint64_t size) {
 #ifndef _WIN32   /* (hookshot) Linux: the whole window is mapped read-write, its pages given on touch (hos_main.c) */
     (void)addr, (void)size;
     return;
-#endif
+#else
     if (!size) return;
     const uint64_t lo = addr & ~0xFFFFULL, hi = (addr + size + 0xFFFF) & ~0xFFFFULL;
     if (!VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE))
         hos_log("mem: commit of %#llx bytes at %#llx failed (error %lu)", (unsigned long long)(hi - lo),
                 (unsigned long long)lo, GetLastError());
+#endif
 }
 
+#ifdef _WIN32
 static LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS *info) {
     EXCEPTION_RECORD *rec = info->ExceptionRecord;
     if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
@@ -47,12 +54,21 @@ static LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS *info) {
 
 /* A crash nothing handles: what, where (mkw.exe+offset: nx2/dllmap.py reads mkw.map the same way), and the guest
    state of the thread, as of its last call out of lifted code, with its frame chain from x29. */
+
+#endif
 static uint64_t peek_guest(uint64_t a) {
+#ifndef _WIN32
+    uint64_t value = 0;
+    if (a >= HOS_GUEST_SPACE - 8 || !hos_guarded_copy(&value, GP(a), 8)) return 0;
+    return value;
+#else
     MEMORY_BASIC_INFORMATION mbi;
     if (a >= HOS_GUEST_SPACE - 8 || !VirtualQuery(GP(a), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return 0;
     return G64(a);
+#endif
 }
 
+#ifdef _WIN32
 static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
     EXCEPTION_RECORD *rec = info->ExceptionRecord;
     const uint64_t rip = info->ContextRecord->Rip;
@@ -67,6 +83,16 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
             rec->NumberParameters > 1 && rec->ExceptionInformation[0] == 1 ? "write" : "read",
             (unsigned long long)addr, (unsigned long long)(addr - (uint64_t)A64_MEM), base ? base + 1 : name,
             (unsigned long long)(rip - (uint64_t)mod));
+#else
+static int report_crash(HosFault *info) {
+    const uint64_t rip = info->pc, addr = info->address;
+    Dl_info module = {0};
+    dladdr((void *)rip, &module);
+    hos_log("CRASH: signal %d (%s %#llx, guest %#llx) at %s+%#llx", info->signal,
+            info->write ? "write" : "read", (unsigned long long)addr,
+            (unsigned long long)(addr - (uintptr_t)A64_MEM), module.dli_fname ? module.dli_fname : "?",
+            (unsigned long long)(rip - (uintptr_t)module.dli_fbase));
+#endif
 #ifdef _WIN32
     {   /* the host stack from the faulting frame (x64 unwind data), as module+offset (nx2/samap.py maps mkw.exe's) */
         CONTEXT ctx = *info->ContextRecord;
@@ -138,7 +164,7 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
     hos_log_flush();
     void hos_hostcall_stats(void);
     hos_hostcall_stats();   /* (HOS_HOSTCALL_STATS=1: the host calls made, and the last 256 of them) */
-    return EXCEPTION_CONTINUE_SEARCH;
+    return 0;
 }
 
 /* (hos_prof.c's, for hos_fatal) the current thread's guest frame chain from x29 */
@@ -172,16 +198,25 @@ static void stats_after(void *p) {
 
 /* heap corruption and fail-fast reports go to the process's end without reaching the unhandled filter: reported here
    first (the backtrace is where the heap noticed, after the bad write) */
+#ifdef _WIN32
 static LONG CALLBACK report_fatal(EXCEPTION_POINTERS *info) {
     const DWORD code = info->ExceptionRecord->ExceptionCode;
     if (code == 0xC0000374 || code == 0xC0000409) report_crash(info);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+#endif
 void hos_commit_init(void) {
+#ifdef _WIN32
     AddVectoredExceptionHandler(1, commit_on_touch);
     AddVectoredExceptionHandler(0, report_fatal);
     SetUnhandledExceptionFilter(report_crash);
+#else
+    stack_t ss = {.ss_size = 64 << 10};
+    ss.ss_sp = malloc(ss.ss_size);
+    if (ss.ss_sp && sigaltstack(&ss, NULL)) free(ss.ss_sp);
+    hos_fault_reporter(report_crash);
+#endif
     const char *after = getenv("HOS_STATS_AFTER");
     if (after && atoi(after) > 0) hos_start_worker(stats_after, (void *)(uintptr_t)atoi(after));
 }
@@ -628,8 +663,8 @@ int hos_mods_romfs(const char *rel, char *out, size_t cap) { (void)rel, (void)ou
    has none (its NVN2 calls go to nvn_native.c), so a submission is only counted. */
 int hos_gpu_async(void) { return 0; }
 void hos_gpu_submit(int channel_fd, const uint64_t *entries, uint32_t n) {
-    static volatile LONG seen;
-    if (InterlockedIncrement(&seen) <= 4) hos_log("gpu: submit of %u entries on channel %d (no GPU yet)", n, channel_fd);
+    static volatile int32_t seen;
+    if (__atomic_add_fetch(&seen, 1, __ATOMIC_SEQ_CST) <= 4) hos_log("gpu: submit of %u entries on channel %d (no GPU yet)", n, channel_fd);
     (void)entries;
 }
 void hos_gpu_queue_submit(int channel_fd, const uint64_t *entries, uint32_t n, int incr_id) {
@@ -680,6 +715,35 @@ void hos_memory_map_log(void) {
     static int on = -1;
     if (on < 0) on = getenv("HOS_MEM_MAP") != NULL;
     if (!on) return;
+#ifndef _WIN32
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return;
+    uint64_t committed = 0, regions = 0, other = 0;
+    struct { uint64_t base, bytes; } top[8] = {{0}};
+    const uint64_t g0 = (uintptr_t)GP(0), g1 = g0 + HOS_GUEST_SPACE;
+    char line[512], perms[8];
+    unsigned long lo, hi;
+    while (fgets(line, sizeof line, maps)) {
+        if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) != 3 || perms[0] != 'r') continue;
+        const uint64_t overlap_lo = lo > g0 ? lo : g0, overlap_hi = hi < g1 ? hi : g1;
+        const uint64_t guest_bytes = overlap_hi > overlap_lo ? overlap_hi - overlap_lo : 0;
+        if (guest_bytes) committed += guest_bytes, regions++;
+        if (perms[3] != 'p') continue;
+        const uint64_t bytes = hi - lo - guest_bytes;
+        other += bytes;
+        for (int k = 0; k < 8; k++) if (bytes > top[k].bytes) {
+            memmove(&top[k+1], &top[k], (7-k)*sizeof top[0]);
+            top[k].base = lo; top[k].bytes = bytes; break;
+        }
+    }
+    fclose(maps);
+    hos_log("mem: guest window %llu MB committed in %llu regions", (unsigned long long)(committed >> 20),
+            (unsigned long long)regions);
+    hos_log("mem: private outside the guest window %llu MB", (unsigned long long)(other >> 20));
+    for (int k = 0; k < 8 && top[k].bytes; k++)
+        hos_log("mem: private mapping %#llx: %llu MB", (unsigned long long)top[k].base,
+                (unsigned long long)(top[k].bytes >> 20));
+#else
     uint64_t committed = 0, regions = 0;
     for (uint64_t a = 0; a < HOS_GUEST_SPACE;) {
         MEMORY_BASIC_INFORMATION m;
@@ -716,6 +780,7 @@ void hos_memory_map_log(void) {
             (unsigned long long)top[2].base, (unsigned long long)(top[2].bytes >> 20), (unsigned long long)top[3].base,
             (unsigned long long)(top[3].bytes >> 20), (unsigned long long)top[4].base, (unsigned long long)(top[4].bytes >> 20),
             (unsigned long long)top[5].base, (unsigned long long)(top[5].bytes >> 20));
+#endif
 }
 void hos_ultrawide_apply(void) {}                 /* (totk_ultrawide.c) */
 float hos_view_aspect;                            /* (totk_ultrawide.c: 0, the game's own 16:9) */
@@ -742,7 +807,7 @@ void hos_process_memory(uint64_t *private_bytes, uint64_t *working_set) {
     }
     fclose(f);
     return;
-#endif
+#else
     typedef struct {
         DWORD cb, PageFaultCount;
         SIZE_T PeakWorkingSetSize, WorkingSetSize, QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage,
@@ -757,4 +822,5 @@ void hos_process_memory(uint64_t *private_bytes, uint64_t *working_set) {
     if (!fn || !fn(GetCurrentProcess(), &m, sizeof m)) memset(&m, 0, sizeof m);
     *private_bytes = m.PrivateUsage;
     *working_set = m.WorkingSetSize;
+#endif
 }

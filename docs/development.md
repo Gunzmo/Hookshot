@@ -34,9 +34,19 @@ locks, monotonic clocks, native thread wakeups and completion waits, and fibers 
 The window, keyboard, mouse, controllers and audio output use SDL3 directly; controller events stay on the window's
 thread. Audio queues at most ten 10 ms blocks and continues to support `HOS_AUDIO_DUMP` and `HOS_AUDIO=0`.
 `host/hos_sync.h` and `host/hos_platform.*` retain Windows implementations of the shared host interfaces.
-`host/linux/windows.h` and `win32.c` remain for renderer interfaces and diagnostic hooks that still consume the
-Win32 API. The tools that run during the build (zbic, the tests) are always built for the PC they run on.
+<!-- coderabbit-ai-generated:v1 -->
 
+<!-- coderabbit-ai-generated-section:v1:15d86bcd5112bb9304544236152d68050c0ca8561062ddc97cfd71f874c004ba -->
+
+The Linux runtime and Vulkan renderer build without `host/linux/windows.h` or `win32.c`. Vulkan loads through
+`dlopen`; renderer thread tuning, cache files, timing and memory probes use native Linux services. Linux fault
+handlers preserve guest crash reports and NVN write watches; guarded copies use `process_vm_readv` so invalid or
+concurrently unmapped ranges fail without delivering a signal. The Insert menu keeps its CPU rasterizer with
+FreeType text. Windows retains its native renderer and diagnostic implementations.
+The tools that run during the build (zbic, the tests) are always built for the PC they run on.
+
+
+<!-- /coderabbit-ai-generated:v1 -->
 Native host checks need no game dump or window server:
 
 ```sh

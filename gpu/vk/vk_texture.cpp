@@ -14,8 +14,12 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>
+#include "vk_platform.h"
+#ifdef _WIN32
 #include <psapi.h>
+#else
+#include <sys/resource.h>
+#endif
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -2494,12 +2498,19 @@ void texture_frame(uint64_t completed) {
             ++it;
         }
         if (frame_no % 600 == 0) {   // (the process's memory now and then: what the host side holds)
+#ifdef _WIN32
             PROCESS_MEMORY_COUNTERS_EX pm{};
             pm.cb = sizeof pm;
             if (K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pm, sizeof pm))
                 logf("vk: memory: working set %llu MB (peak %llu), private %llu MB, staging %llu MB in %zu arenas",
                      (unsigned long long)(pm.WorkingSetSize >> 20), (unsigned long long)(pm.PeakWorkingSetSize >> 20),
                      (unsigned long long)(pm.PrivateUsage >> 20), (unsigned long long)(kept >> 20), arenas.size());
+#else
+            struct rusage usage{};
+            getrusage(RUSAGE_SELF, &usage);
+            logf("vk: memory: peak resident %llu MB, staging %llu MB in %zu arenas",
+                 (unsigned long long)(usage.ru_maxrss >> 10), (unsigned long long)(kept >> 20), arenas.size());
+#endif
         }
     }
     for (auto it = dead.begin(); it != dead.end();) {

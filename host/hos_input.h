@@ -60,7 +60,13 @@
 #define HOS_KEY_F10 0x79
 #define HOS_KEY_F11 0x7A
 #define HOS_KEY_F12 0x7B
+#ifdef __cplusplus
+extern "C" {
+#endif
 int hos_linux_key_down(int key);
 int hos_linux_has_focus(void);
 void hos_linux_screen_size(int *width, int *height);
+#ifdef __cplusplus
+}
+#endif
 #endif

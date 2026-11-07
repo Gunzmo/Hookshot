@@ -1,3 +1,4 @@
+#include "vk_platform.h"
 // Frame dumps (vk_dump.h): each step's image blitted (nearest) into a small RGBA32 image of its numeric kind and copied
 // to host memory with the submission; written once the submission completed.
 #include <algorithm>
@@ -8,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include <direct.h>
+
 
 #include "vk_dump.h"
 
@@ -264,7 +265,7 @@ void dump_present(int64_t presents) {
     seq = 0;
     const char* base = getenv("RX_VK_DUMP_DIR") ? getenv("RX_VK_DUMP_DIR") : getenv("RX_VK_SHOTS");
     dir = std::string(base ? base : ".") + "/dump_" + std::to_string(presents);
-    _mkdir(dir.c_str());
+    vk_platform::mkdir(dir.c_str());
     logf("vk: dumping the frame after present %lld to %s", (long long)presents, dir.c_str());
 }
 

@@ -1,3 +1,4 @@
+#include "vk_platform.h"
 // The NVN replay on Vulkan: the game's recorded command buffers (host/nvn_native.c, records in rx_nvn.h) at each
 // submit, recorded into a Vulkan command buffer and submitted with the next value of a timeline semaphore (the NVN
 // fences); and the window presents.
@@ -891,8 +892,8 @@ struct ParPool {
 };
 ParPool par_pool;
 void par_worker_main() {
-    SetThreadDescription(GetCurrentThread(), L"mkw_vk replay worker");
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    vk_platform::name(L"mkw_vk replay worker");
+    vk_platform::priority(1);
     for (;;) {
         std::function<void()> fn;
         {
@@ -1491,9 +1492,9 @@ void sync_drain(int why) {
     update_blocked();
 }
 void sync_watch() {
-    SetThreadDescription(GetCurrentThread(), L"mkw_vk order");
+    vk_platform::name(L"mkw_vk order");
     for (;;) {
-        Sleep(1);
+        vk_platform::sleep(1);
         if (!blocked_n.load()) continue;
         std::unique_lock lk(sync_order_mu, std::try_to_lock);
         if (!lk) continue;
@@ -1630,7 +1631,7 @@ void invalidate(uint64_t gpu, uint64_t size) {
     // waited for the work that wrote them; the replay is caught up first)
     {   // (RX_VK_READBACK_OFF_FILE=<path> (A/B): while that file exists, not)
         static const char* off_file = getenv("RX_VK_READBACK_OFF_FILE");
-        if (off_file && GetFileAttributesA(off_file) != INVALID_FILE_ATTRIBUTES) return;
+        if (off_file && vk_platform::exists(off_file)) return;
     }
     // (the replay caught up first only for ranges a texture the GPU wrote may be in: MKW invalidates a few buffer
     // ranges every frame (GPU results it reads back, written back with their submission; one of them a ring of
@@ -2034,7 +2035,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
             static const bool dump_key = getenv("RX_VK_DUMP_KEY") != nullptr;
             static bool was_down;
             static int key_left = 8;
-            const bool down = dump_key && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+            const bool down = dump_key && (vk_platform::key(0x78) & 0x8000) != 0;
             if (down && !was_down && key_left > 0) {
                 key_left--;
                 static const int n = getenv("RX_VK_DUMP_KEY_N") ? std::max(1, atoi(getenv("RX_VK_DUMP_KEY_N"))) : 1;
@@ -2053,8 +2054,8 @@ void do_present(const nvn_tex* t, const int crop[4]) {
                 mod_m = 0;
                 if (const char* e = getenv("RX_VK_DUMP_MOD")) sscanf(e, "%d,%d,%d", &mod_m, &mod_r, &mod_n);
             }
-            if (dump_file && presents % 10 == 0 && GetFileAttributesA(dump_file) != INVALID_FILE_ATTRIBUTES) {
-                DeleteFileA(dump_file);
+            if (dump_file && presents % 10 == 0 && vk_platform::exists(dump_file)) {
+                std::remove(dump_file);
                 if (mod_m > 0) {
                     mod_left = std::max(1, mod_n);
                     logf("vk: dump file at present %lld: the next %d frames at %d mod %d are dumped", (long long)presents,
@@ -2264,7 +2265,7 @@ bool framelog_ready() {
     for (LogSlot& l : log_slots)
         if (!create_buffer_cached((uint64_t)kLogW * kLogH * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, l.buf, l.alloc, &l.map)) return false;
     std::thread([] {
-        SetThreadDescription(GetCurrentThread(), L"mkw_vk frame log");
+        vk_platform::name(L"mkw_vk frame log");
         FILE* f = fopen(framelog_path(), "wb");
         for (;;) {
             std::vector<uint8_t> rec;
@@ -2289,7 +2290,7 @@ bool framelog_on() {
     if (now >= next) {
         next = now + 250000000;
         const std::string go = std::string(framelog_path()) + ".go";
-        on = GetFileAttributesA(go.c_str()) != INVALID_FILE_ATTRIBUTES;
+        on = vk_platform::exists(go.c_str());
     }
     return on && framelog_ready();
 }
@@ -2559,12 +2560,12 @@ bool async_on() {
 }
 
 void replay_thread_main() {
-    SetThreadDescription(GetCurrentThread(), L"mkw_vk replay");
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    vk_platform::name(L"mkw_vk replay");
+    vk_platform::priority(1);
     // (on the core the host keeps free of the game's threads, hos_reserved_cpus: its last physical one)
     if (host->reserved_cpus) {
         if (const uint64_t m = host->reserved_cpus()) {
-            SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)m);
+            vk_platform::affinity(m);
             logf("vk: the replay thread runs on logical processors %#llx, kept from the game's threads", (unsigned long long)m);
         }
     }

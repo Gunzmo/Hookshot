@@ -10,7 +10,7 @@
 #endif
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#include <windows.h>
+#include "vk_platform.h"
 #include <vulkan/vulkan.h>
 
 #define VKX_GLOBAL(X)                                                                                                 \

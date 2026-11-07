@@ -1,3 +1,4 @@
+#include "vk_platform.h"
 // Draws and dispatches: a program's pipeline layout (its stages' descriptors in Eden's order, as the SPIR-V back end
 // numbered them, one push-descriptor set when they fit), graphics pipelines (whatever Vulkan 1.3 and
 // VK_EXT_extended_dynamic_state3 take as dynamic state is dynamic; the rest is the key), each draw's descriptors
@@ -324,8 +325,8 @@ std::string pcache_path;
 std::atomic<int64_t> pcache_built_since_save{0};
 void pcache_init() {
     if (pcache) return;
-    char exe[MAX_PATH];
-    const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    char exe[4096];
+    const uint32_t n = vk_platform::executable(exe, sizeof exe);
     std::string dir(exe, n);
     dir = dir.substr(0, dir.find_last_of("\\/") + 1);
     pcache_path = dir + "mkw_vk_pipelines.bin";
@@ -467,8 +468,8 @@ std::mutex note_mu;
 FILE* note_file = nullptr;
 std::unordered_set<uint64_t> noted;   // (a pipeline once in the file, however many runs meet it)
 std::string pipe_notes_path() {
-    char exe[MAX_PATH];
-    const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    char exe[4096];
+    const uint32_t n = vk_platform::executable(exe, sizeof exe);
     std::string dir(exe, n);
     return dir.substr(0, dir.find_last_of("\\/") + 1) + "hookshot_pipelines.bin";
 }
@@ -494,7 +495,7 @@ void pipeline_note(uint64_t key, const Program& p, const NvnState& s, const Targ
             if (FILE* f = fopen(path.c_str(), "rb")) {
                 for (int64_t at = 16;; at += sizeof(PipeNote)) {
                     uint64_t k = 0;
-                    _fseeki64(f, at, SEEK_SET);
+                    vk_platform::seek(f, at, SEEK_SET);
                     if (fread(&k, 8, 1, f) != 1) break;
                     noted.insert(k);
                 }
@@ -3457,8 +3458,8 @@ bool precompile_wanted() {
 /// Every shader of the game, before its first start (vk_shader.cpp, the seed): once for this translator
 void prepare_run(void (*progress)(size_t done, size_t total)) {
     const auto t0 = std::chrono::steady_clock::now();
-    char exe[MAX_PATH];
-    const DWORD exe_n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    char exe[4096];
+    const uint32_t exe_n = vk_platform::executable(exe, sizeof exe);
     std::string path(exe, exe_n);
     path = path.substr(0, path.find_last_of("\\/") + 1) + "hookshot_prepared.bin";
     const uint64_t stamp = program_cache_stamp();
@@ -3492,7 +3493,7 @@ void prepare_run(void (*progress)(size_t done, size_t total)) {
     std::atomic<size_t> next{0}, done{0}, made{0}, libs{0};
     const auto worker = [&] {
         // (below normal, and half the CPUs, below: on all of them at High the driver's compiles froze the whole PC)
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        vk_platform::priority(-1);
         for (;;) {
             const size_t i = next++;
             if (i >= total) return;
@@ -3520,7 +3521,7 @@ void prepare_run(void (*progress)(size_t done, size_t total)) {
     for (unsigned i = 0; i < std::clamp(cpus / 2, 1u, 32u); i++) threads.emplace_back(worker);
     while (done.load() < total) {
         if (progress) progress(done.load(), total);
-        Sleep(100);
+        vk_platform::sleep(100);
         if (next.load() >= total + threads.size()) break;
     }
     for (std::thread& t : threads) t.join();
@@ -3613,7 +3614,7 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     for (unsigned i = 0; i < std::min(cpus, 64u); i++) threads.emplace_back(worker);
     while (done.load() < total) {
         if (progress) progress(done.load(), total);
-        Sleep(100);
+        vk_platform::sleep(100);
         if (next.load() >= total + threads.size()) break;
     }
     for (std::thread& t : threads) t.join();
@@ -3942,7 +3943,7 @@ void pipeline_cache_save(bool force) {
     static std::atomic<bool> busy{false};
     if (busy.exchange(true)) {
         if (!force) return;
-        while (busy.load()) Sleep(1);   // (the one under way, then this one)
+        while (busy.load()) vk_platform::sleep(1);   // (the one under way, then this one)
         busy = true;
     }
     auto save = [] {
@@ -3954,7 +3955,7 @@ void pipeline_cache_save(bool force) {
                 if (FILE* f = fopen(tmp.c_str(), "wb")) {
                     const bool ok = fwrite(data.data(), 1, n, f) == n;
                     fclose(f);
-                    if (ok) MoveFileExA(tmp.c_str(), pcache_path.c_str(), MOVEFILE_REPLACE_EXISTING);
+                    if (ok) vk_platform::replace(tmp.c_str(), pcache_path.c_str());
                 }
             }
         }

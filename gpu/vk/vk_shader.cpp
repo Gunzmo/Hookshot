@@ -1,3 +1,4 @@
+#include "vk_platform.h"
 // NVN2 programs to SPIR-V with Eden's shader recompiler (gpu/vk/eden). A stage's package is its control section
 // (guest memory, 0xd8 bytes: magic 0x98761234, code length +0x38, c1 constants +0x40..+0x44, stage +0x56, workgroup
 // size +0x58) and its code area (GPU memory: a graphics stage's 128-byte header, then the Ampere instructions, then
@@ -9,7 +10,7 @@
 // A program's stages are emitted with one Backend::Bindings, so their descriptors share one set in Eden's order
 // (per stage: uniform buffers, storage buffers, texture buffers, image buffers, textures, images), which
 // vk_pipeline.cpp lays out from the stages' Info the same way.
-#include <io.h>
+
 #include <algorithm>
 #include <chrono>
 #include <stdexcept>
@@ -768,7 +769,12 @@ uint64_t disk_stamp() {
     const uint32_t depth = host->depth_minus_w() != 0;   // (d3zessete's PR 54: programs made in either depth mode are kept apart)
     add(&depth, sizeof depth);
     
-    for (char** e = _environ; e && *e; e++)
+#ifdef _WIN32
+    char **environment = _environ;
+#else
+    char **environment = environ;
+#endif
+    for (char** e = environment; e && *e; e++)
         for (const char* pre : {"RX_VK_OOT", "RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "EDEN_"})
             if (!strncmp(*e, pre, strlen(pre))) add(*e, strlen(*e));
     return h;
@@ -778,16 +784,16 @@ void disk_init() {
     static std::once_flag once;
     std::call_once(once, [] {
         if (getenv("RX_VK_NO_PROGRAM_CACHE")) return;
-        char exe[MAX_PATH];
-        const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        char exe[4096];
+        const uint32_t n = vk_platform::executable(exe, sizeof exe);
         std::string path(exe, n);
         path = path.substr(0, path.find_last_of("\\/") + 1) + "hookshot_programs.bin";
         const uint64_t stamp = disk_stamp();
         int64_t good = 0, whole = 0;
         if (FILE* f = fopen(path.c_str(), "rb")) {
-            _fseeki64(f, 0, SEEK_END);
-            whole = _ftelli64(f);
-            _fseeki64(f, 0, SEEK_SET);
+            vk_platform::seek(f, 0, SEEK_END);
+            whole = vk_platform::tell(f);
+            vk_platform::seek(f, 0, SEEK_SET);
             uint32_t head[2]{};
             uint64_t kept = 0;
             if (whole >= 16 && fread(head, 4, 2, f) == 2 && fread(&kept, 8, 1, f) == 1 && head[0] == kDiskMagic && kept == stamp) {
@@ -795,7 +801,7 @@ void disk_init() {
                 while (good + 20 <= whole) {
                     uint64_t rec[2];
                     uint32_t kind = 0;
-                    _fseeki64(f, good, SEEK_SET);
+                    vk_platform::seek(f, good, SEEK_SET);
                     if (fread(rec, 8, 2, f) != 2 || fread(&kind, 4, 1, f) != 1) break;
                     if (good + 16 + (int64_t)rec[1] > whole) break;   // (the run stopped while writing it)
                     disk_records[rec[0]].push_back({good + 16, (size_t)rec[1], kind});
@@ -806,7 +812,7 @@ void disk_init() {
         }
         if (good) {
             if (good != whole) {   // (a record cut short: without it)
-                if (FILE* f = fopen(path.c_str(), "r+b")) _chsize_s(_fileno(f), good), fclose(f);
+                if (FILE* f = fopen(path.c_str(), "r+b")) vk_platform::truncate(f, good), fclose(f);
             }
             disk_out = fopen(path.c_str(), "ab");
         } else {
@@ -911,8 +917,8 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     }
     const uint64_t head[2] = {p.key, o.size()};
     std::lock_guard lk(disk_mu);
-    _fseeki64(disk_out, 0, SEEK_END);
-    const int64_t at = _ftelli64(disk_out);
+    vk_platform::seek(disk_out, 0, SEEK_END);
+    const int64_t at = vk_platform::tell(disk_out);
     fwrite(head, 8, 2, disk_out);
     fwrite(o.data(), 1, o.size(), disk_out);
     fflush(disk_out);
@@ -936,7 +942,7 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
         std::vector<uint8_t> data(d.size);
         {
             std::lock_guard lk(disk_mu);
-            _fseeki64(disk_in, d.at, SEEK_SET);
+            vk_platform::seek(disk_in, d.at, SEEK_SET);
             if (fread(data.data(), 1, d.size, disk_in) != d.size) continue;
         }
         Reader r{data.data()};
@@ -1482,8 +1488,8 @@ struct Seed {
     std::vector<std::vector<uint32_t>> programs;
 } seed;
 std::string beside_exe(const char* name) {
-    char exe[MAX_PATH];
-    const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    char exe[4096];
+    const uint32_t n = vk_platform::executable(exe, sizeof exe);
     std::string dir(exe, n);
     return dir.substr(0, dir.find_last_of("\\/") + 1) + name;
 }
@@ -1497,9 +1503,9 @@ std::string seed_path() { return beside_exe("hookshot_shaders.bin"); }
 
 size_t seed_open() {
     if (FILE* f = fopen(seed_path().c_str(), "rb")) {
-        _fseeki64(f, 0, SEEK_END);
-        seed.blob.resize((size_t)_ftelli64(f));
-        _fseeki64(f, 0, SEEK_SET);
+        vk_platform::seek(f, 0, SEEK_END);
+        seed.blob.resize((size_t)vk_platform::tell(f));
+        vk_platform::seek(f, 0, SEEK_SET);
         if (seed.blob.size() < 16 || fread(seed.blob.data(), 1, seed.blob.size(), f) != seed.blob.size() ||
             memcmp(seed.blob.data(), "HKSEED01", 8))
             seed.blob.clear();

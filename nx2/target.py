@@ -5,7 +5,7 @@ RX_TARGET (or build.py / make_game.py --target):
   windows  the default: hookshot.exe + hookshot_vk.dll. On Windows as before; from a Linux PC a cross-build, with
            Microsoft's C library and Windows SDK in a /winsysroot-style folder (scripts/setup-winsysroot.sh, with xwin):
            RX_WINSYSROOT, or ~/.local/share/hookshot/winsysroot. Runs with Proton or Wine.
-  linux    a native ELF: hookshot + libhookshot_vk.so, on host/linux (Win32 over POSIX, the window and audio on SDL3).
+  linux    a native ELF: hookshot + libhookshot_vk.so, with native POSIX host services, Vulkan and SDL3.
 """
 import os
 import shutil

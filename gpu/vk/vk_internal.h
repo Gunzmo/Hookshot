@@ -196,10 +196,7 @@ enum ProfPhase { PROF_SUBMIT, PROF_PRESENT, PROF_DRAW, PROF_DESC, PROF_TEXGET, P
                  PROF_CMDS, PROF_DISPATCH, PROF_MEMSYNC, PROF_QSUBMIT, PROF_SLOTWAIT, PROF_COUNT };
 extern int64_t prof_ns[PROF_COUNT];
 inline int64_t prof_now() {
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    static const int64_t freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f.QuadPart; }();
-    return (int64_t)((double)t.QuadPart * 1e9 / (double)freq);
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 struct ProfScope {
     int phase;

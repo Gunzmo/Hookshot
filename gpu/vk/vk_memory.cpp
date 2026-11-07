@@ -21,7 +21,7 @@
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "vk_platform.h"
 
 #include "vk_internal.h"
 #include "vk_texture.h"   // (upload_command_buffer)
@@ -60,9 +60,9 @@ extern Pool* pool_cache[4096];
 void retire_pool(std::map<uint64_t, Pool>::iterator it);
 Pool* pool_lookup(uint64_t guest, uint64_t size);
 struct SrwMutex {   // (a slim reader/writer lock: half std::mutex's cost, taken for every buffer a draw binds)
-    SRWLOCK l = SRWLOCK_INIT;
-    void lock() { AcquireSRWLockExclusive(&l); }
-    void unlock() { ReleaseSRWLockExclusive(&l); }
+    std::mutex l;
+    void lock() { l.lock(); }
+    void unlock() { l.unlock(); }
 };
 SrwMutex pools_mu;
 uint32_t generation = ~0u;
@@ -97,6 +97,7 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
     } report{t0, t1, t2, t3, t4};
     // (pages the game has not touched yet may be only reserved: committed now, as the pool's memory is usable; a range
     // committed already is left alone: the call took milliseconds in the game's huge reservation)
+#ifdef _WIN32
     {
         for (uint8_t* q = ptr; q < ptr + bytes;) {
             MEMORY_BASIC_INFORMATION mi{};
@@ -106,6 +107,7 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
             q = end;
         }
     }
+#endif
     // (the host allocations' memory type: the same for every pointer, asked once)
     static uint32_t type = UINT32_MAX;
     if (type == UINT32_MAX) {
@@ -679,10 +681,10 @@ bool overlay_off() {
     if (!path) return false;
     static std::atomic<int64_t> next{0};
     static std::atomic<bool> off{false};
-    const int64_t now = GetTickCount64();
+    const int64_t now = vk_platform::milliseconds();
     if (now >= next.load(std::memory_order_relaxed)) {
         next.store(now + 200, std::memory_order_relaxed);
-        const bool v = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+        const bool v = vk_platform::exists(path);
         if (v != off.exchange(v)) logf("vk: texture storage as submitted: %s (A/B file)", v ? "OFF" : "on");
     }
     return off.load(std::memory_order_relaxed);
@@ -729,8 +731,8 @@ void memory_drop_shadow(uint64_t guest, uint64_t size) {
 /// -fasync-exceptions clang catches a fault in a __try block only across a call, and a 4 KB memcpy inlined into the
 /// block (the per-page retry) faulted past the handler: the crash that kept the texture storage out of the capture.
 void* (*volatile guarded_memcpy)(void*, const void*, size_t) = std::memcpy;
-#ifndef _WIN32   // (hookshot) Linux: a fault is a signal (host/linux/win32.c)
-bool guarded_copy(void* dst, const void* src, size_t n) { return win32_guarded_copy(dst, src, n) != 0; }
+#ifndef _WIN32   // Linux: the kernel validates both ranges without delivering a signal.
+bool guarded_copy(void* dst, const void* src, size_t n) { return hos_guarded_copy(dst, src, n) != 0; }
 #else
 __declspec(noinline) bool guarded_copy(void* dst, const void* src, size_t n) {
     __try {
@@ -755,7 +757,7 @@ void copy_part(const CopyPart& w) {
         if (ga + 4096 > gsize) { i++; continue; }
         int64_t j = i + 1;
         while (j < w.i1 && w.pages[j] == w.pages[j - 1] + 1 && ((uint64_t)w.pages[j] << kPageShift) + 4096 <= gsize) j++;
-        if (guarded_copy(w.out + (uint64_t)i * 4096, base + ga, (SIZE_T)(j - i) * 4096)) {
+        if (guarded_copy(w.out + (uint64_t)i * 4096, base + ga, (size_t)(j - i) * 4096)) {
             std::memset(w.ok + i, 1, (size_t)(j - i));
         } else {
             for (int64_t q = i; q < j; q++)
@@ -772,7 +774,7 @@ struct CopyHelpers {
     bool started = false;
 } copy_helpers;
 void copy_helper_main() {
-    SetThreadDescription(GetCurrentThread(), L"mkw_vk capture copy");
+    vk_platform::name(L"mkw_vk capture copy");
     for (;;) {
         CopyPart w;
         {
@@ -1023,7 +1025,7 @@ std::vector<std::pair<uint64_t, Pool>> bg_ready;
 int64_t st_bg_imports, st_bg_waits;
 
 void bg_main() {
-    SetThreadDescription(GetCurrentThread(), L"mkw_vk imports");
+    vk_platform::name(L"mkw_vk imports");
     for (;;) {
         std::pair<uint64_t, uint64_t> r;
         {
