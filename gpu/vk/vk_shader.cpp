@@ -759,8 +759,15 @@ uint64_t disk_stamp() {
     // lost it)
     const uint64_t translator = HOOKSHOT_SHADER_STAMP;
     add(&translator, sizeof translator);
+#ifdef _LIBCPP_VERSION
+    // (hookshot) the records hold Shader::Info as it lies, and its std:: members are laid out by the C++ library: a
+    // cache of a libstdc++ build read by a libc++ one (nx2/build.py RX_LIBCXX) crashed in program_cache_load
+    const uint64_t layout = (uint64_t)sizeof(Shader::Info) << 32 | _LIBCPP_VERSION;
+    add(&layout, sizeof layout);
+#endif
     const uint32_t depth = host->depth_minus_w() != 0;   // (d3zessete's PR 54: programs made in either depth mode are kept apart)
     add(&depth, sizeof depth);
+    
     for (char** e = _environ; e && *e; e++)
         for (const char* pre : {"RX_VK_OOT", "RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "EDEN_"})
             if (!strncmp(*e, pre, strlen(pre))) add(*e, strlen(*e));
@@ -1021,6 +1028,7 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
             // same key)
             for (int i = 0; i < 16; i++) vrt.generic_input_types[i] = attribute_type_of(s.vattr[i]);
             vrt.previous_stage_stores.mask.set();
+            // (hookshot) GL's near = -w before the game says so, for the programs prepared before it does (host/nvn_native.c)
             vrt.convert_depth_mode = host->depth_minus_w() != 0;
             Stage v;
             v.nvn_stage = 0;

@@ -15,11 +15,44 @@ Status: the dump is read and lifted (100 % translated, the instruction test pass
 
 ## Use
 
-Requirements: Python 3 with `lz4`, `numpy`, `capstone`, `unicorn` (2.1), `zstandard`; emsdk's clang at `C:\emsdk` (or `EMSDK`);
+Requirements: Python 3 with `lz4`, `numpy`, `capstone`, `zstandard`, `unicorn` (2.1); emsdk's clang at `C:\emsdk` (or `EMSDK`);
 for the Vulkan back end, Eden's CPM package cache (found in mkw-recomp's `work/eg` or `..\Eglantine\.cache\cpm`, or
 `RX_CPM`).
 
 Run everything with `python -I` from this folder.
+
+Targets (`nx2/target.py`): `build.py` and `make_game.py` take `--target windows` (the default; `RX_TARGET`) or `linux`.
+From a Linux PC, `windows` is a cross-build with the system's clang and lld-link over a /winsysroot-style copy of
+Microsoft's C library and Windows SDK (`scripts/setup-winsysroot.sh`, xwin; `RX_WINSYSROOT`, default
+`~/.local/share/hookshot/winsysroot`), and the game runs with Proton or Wine. `linux` is native: `hookshot_rt` +
+`libhookshot_vk.so`. The host's Win32 calls are answered by `host/linux` (`windows.h` and `win32.c`: Win32 over
+POSIX), the window, keyboard and mouse are SDL3's (`host/linux/display_sdl.c`, Wayland first, else X11), waveOut plays
+through SDL3's audio, and the controllers are SDL3's on both systems (`host/pad_sdl.c`). The tools that run during the
+build (zbic, the tests) are always built for the PC they run on.
+
+### Dependencies and release folders
+
+`scripts/fetch-deps.sh [linux|windows|all]` fetches what the repository does not hold, at pinned versions with their
+sha256: the Vulkan and SPIR-V headers and VMA (`RX_CPM=work/deps/cpm`), FFmpeg's LGPL shared builds, SDL3 (Windows'
+DLL; for Linux built from its source into `work/deps/linux-sdl3`, which needs cmake, make and Wayland's, X11's,
+PipeWire's, PulseAudio's, ALSA's and udev's headers), LLVM's libc++ (`work/deps/linux-libcxx`), and the release
+folders' Python and LLVM.
+
+A Linux release is built on Ubuntu 22.04 (glibc 2.35, so it runs on Debian 12 and later) with
+`RX_SDL3=work/deps/linux-sdl3` (libSDL3.so.0 bundled beside the runtime, rpath `$ORIGIN`) and
+`RX_LIBCXX=work/deps/linux-libcxx` (libc++ linked statically into the renderer and the C++ helper: 22.04's libstdc++
+has no `<format>`, and the release then asks for no libstdc++). `ci/github/release.yml` does this and tests both
+folders in bare systems; `ci/github/cross-windows.yml` cross-builds the Windows one on Linux. Both are inactive (kept
+out of `.github/workflows/`).
+
+The split build (`nx2/module.py`): `build.py --part runtime` makes the game-independent runtime once
+(`work/runtime-<target>`: `hookshot_rt[.exe]`, the Vulkan back end, and the files a module links against), and
+`build.py --part game` makes the game module from a lift against it (`hookshot_game.dll` / `libhookshot_game.so`,
+in `work/sa/game-<target>`). The module compiles against `nx2/rt/crt` instead of an SDK, so the player's PC needs no
+Windows SDK, Visual Studio or libc headers. `scripts/package.py` puts a runtime, the launcher (`launcher/hookshot.c`)
+and the build scripts in a release folder; the launcher builds the game module from the player's `.nup` the first time,
+and again when the runtime changes (`runtime.stamp` against `game.stamp`). The one-executable build (no `--part`) is
+unchanged and stays the development build.
 
 | Command | What |
 |---|---|
@@ -34,6 +67,23 @@ Run everything with `python -I` from this folder.
 | `python -I scripts/prof.py <stacks file>` | a profile sampled with `HOS_SAMPLE=<thread>` + `HOS_SAMPLE_FILE=<stacks file>`, named from the linker maps |
 
 The dump can also come from `OOT_DUMP` (its folder) or `OOT_EXEFS`; `OOT_WORK` moves the work folder.
+
+For test runs:
+
+| Variable | What |
+|---|---|
+| `HOS_HEADLESS=1` | no window; with `RX_VK_SHOTS=<dir>` (and `RX_VK_SHOT_EVERY=<frames>`) the frames are written out |
+| `HOS_INPUT_SCRIPT` | timed presses, `"<seconds>:<button>[+...][/<ms>],..."` (`host/nn_hid.c`); `15:A,20:A,...` loads a save |
+| `RX_VK_MENU_OPEN=1` or `controls` | the Insert menu open from the first frame, on its Controls page with `controls` |
+| `RX_VK_PRECOMPILE=0` | no shader preparation: each shader is translated when first drawn |
+| `HOOKSHOT_JOBS` | make_game.py's default `--jobs`, the launcher's builds included |
+
+The saves' folder (`host/hos_main.c` saves_dir): started from its own folder, the game keeps its saves in
+`Documents\My Games\Hookshot` or `$XDG_DATA_HOME/hookshot`, and moves a `user/` folder beside the executable there
+entry by entry the first time; started with an image path, it keeps `user/` in the current folder; `--user` wins.
+
+`hookshot_rt --prepare-shaders` prepares every shader without starting the game (the launcher's "Preparing shaders"
+step). A runtime built with libc++ keeps its own program cache, since the records hold C++ library types as they lie.
 
 ## Layout
 

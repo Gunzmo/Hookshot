@@ -9,6 +9,9 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#ifndef _WIN32
+#include <unistd.h>   // (hookshot) isatty
+#endif
 
 #include "vk_api.h"
 #include "vk_internal.h"
@@ -84,13 +87,28 @@ bool create_instance() {
         logf("vk: the Vulkan loader is %u.%u: 1.3 is needed", VK_VERSION_MAJOR(version), VK_VERSION_MINOR(version));
         return false;
     }
+#ifdef _WIN32
     const char* exts[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+    const uint32_t nexts = 2;
+#else   // (hookshot) every window system's surface the loader has: the toolkit picks its own (HosLinuxWindow)
+    const char* exts[4] = {VK_KHR_SURFACE_EXTENSION_NAME};
+    uint32_t nexts = 1;
+    {
+        uint32_t n = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> have(n);
+        vkEnumerateInstanceExtensionProperties(nullptr, &n, have.data());
+        for (const char* want : {"VK_KHR_xlib_surface", "VK_KHR_xcb_surface", "VK_KHR_wayland_surface"})
+            for (const VkExtensionProperties& e : have)
+                if (!strcmp(e.extensionName, want)) { exts[nexts++] = want; break; }
+    }
+#endif
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "mkw-recomp";
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ci.pApplicationInfo = &app;
-    ci.enabledExtensionCount = 2;
+    ci.enabledExtensionCount = nexts;
     ci.ppEnabledExtensionNames = exts;
     // RX_VK_VALIDATION=1: the Khronos validation layer (when installed)
     const char* layer = "VK_LAYER_KHRONOS_validation";
@@ -351,9 +369,44 @@ bool create_swapchain(uint32_t width, uint32_t height) {
 namespace {
 
 HWND main_window = nullptr;
+// (hookshot) hookshot_rt --prepare-shaders (the launcher, after a build): the same work with no game, its progress as
+// "@@progress" lines on stdout. A skip there leaves hookshot_prepare_skipped beside the runtime: the game's own starts then
+// leave the work out too (what was not prepared is built when first drawn), until a --prepare-shaders run ends it
+bool prepare_only() { return getenv("HOOKSHOT_PREPARE_ONLY") != nullptr; }
+std::string skipped_path() {
+    char exe[MAX_PATH];
+    const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    std::string path(exe, n);
+    return path.substr(0, path.find_last_of("\\/") + 1) + "hookshot_prepare_skipped";
+}
 bool started_up() {
     if (const char* e = getenv("RX_VK_START_DELAY")) Sleep((DWORD)atoi(e) * 1000);   // (diagnosis: a long start, as the first one is)
     if (!replay_start()) return false;
+    if (prepare_only()) {
+        static int part;   // (two parts: the programs, then the pipelines the notes name; most of the time is the first)
+        const auto progress = [](size_t done, size_t total) {
+            static size_t last = ~(size_t)0;
+            if (!total) return;
+            const size_t at = (part ? 900 : 0) + done * (part ? 100 : 900) / total;
+            if (at == last) return;
+            last = at;
+            printf("@@progress %.3f\n", at / 1000.0);
+            fflush(stdout);
+        };
+        printf("@@stage shaders Preparing shaders\n");
+        fflush(stdout);
+        part = 0;
+        prepare_run(progress);
+        part = 1;
+        precompile_run(progress);
+        remove(skipped_path().c_str());
+        return true;
+    }
+    if (FILE* f = fopen(skipped_path().c_str(), "rb")) {
+        fclose(f);
+        logf("vk: the shaders' preparation was skipped at the build: left to when each is first drawn");
+        return true;
+    }
     if (precompile_wanted()) {   // (a release build, before the game: nothing to build during play)
         // (a console while it lasts: there is no window yet, and a long wait with nothing on screen looks like a hang)
         static HANDLE console = nullptr;
@@ -368,8 +421,11 @@ bool started_up() {
                     if (console == INVALID_HANDLE_VALUE) console = nullptr;
                 }
             }
-            if (!console) return;
             char line[80];
+#ifndef _WIN32   // (hookshot) Linux: on the terminal it was started from, if any
+            if (isatty(2)) fprintf(stderr, "\rPreparing shaders: %zu of %zu (%zu%%)   %s", done, total, done * 100 / total, done == total ? "\n" : "");
+#endif
+            if (!console) return;
             const int n = snprintf(line, sizeof line, "%cPreparing shaders: %zu of %zu (%zu%%)   ", 13, done, total, done * 100 / total);
             DWORD wrote = 0;
             WriteFile(console, line, (DWORD)n, &wrote, nullptr);
@@ -389,16 +445,26 @@ int start(void* hwnd) {
         logf("vk: no window: presents render offscreen (%ux%u)", dev.swap_extent.width, dev.swap_extent.height);
         return started_up() ? 1 : 0;
     }
+#ifdef _WIN32
     VkWin32SurfaceCreateInfoKHR si{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
     si.hinstance = GetModuleHandleA(nullptr);
     si.hwnd = (HWND)hwnd;
     if (vkCreateWin32SurfaceKHR(dev.instance, &si, nullptr, &dev.surface) != VK_SUCCESS) return 0;
+    RECT r{};
+    GetClientRect((HWND)hwnd, &r);
+    const int width = r.right - r.left, height = r.bottom - r.top;
+#else   // (hookshot) Linux: the window's toolkit makes the surface (host/linux/display_sdl.c)
+    const HosLinuxWindow* w = (const HosLinuxWindow*)hwnd;
+    uint64_t surface = 0;
+    if (!w->vk_surface(w->native, dev.instance, &surface)) return 0;
+    dev.surface = (VkSurfaceKHR)surface;
+    int width = 0, height = 0;
+    w->size(w->native, &width, &height);
+#endif
     VkBool32 ok = VK_FALSE;
     vkGetPhysicalDeviceSurfaceSupportKHR(dev.physical, dev.queue_family, dev.surface, &ok);
     if (!ok) return 0;
-    RECT r{};
-    GetClientRect((HWND)hwnd, &r);
-    if (!create_swapchain((uint32_t)(r.right - r.left), (uint32_t)(r.bottom - r.top))) return 0;
+    if (!create_swapchain((uint32_t)width, (uint32_t)height)) return 0;
     return started_up() ? 1 : 0;
 }
 
@@ -420,7 +486,7 @@ MkwVkRenderer table;
 } // namespace
 } // namespace mkwvk
 
-extern "C" __declspec(dllexport) const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
+extern "C" MKWVK_EXPORT const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
     using namespace mkwvk;
     if (!h || h->version != MKWVK_API_VERSION) return nullptr;
     host = h;

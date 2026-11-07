@@ -685,6 +685,7 @@ HLE(_ZN2nn2os23StartPeriodicTimerEventEPNS0_14TimerEventTypeENS_8TimeSpanES3_) {
     t->due_ns = hos_now_ns() + (int64_t)ARG(1);
     t->period_ns = (int64_t)ARG(2);
     t->signaled = 0;
+    WakeAllConditionVariable(&t->cv);   /* (a WaitTimerEvent that came first) */
     ReleaseSRWLockExclusive(&t->lk);
     WakeAllConditionVariable(&t->cv);   /* (a first wait that beat this start sleeps on the cv) */
     poke_multiwait();
@@ -695,7 +696,6 @@ HLE(_ZN2nn2os14WaitTimerEventEPNS0_14TimerEventTypeE) {
     while (!t->due_ns) hos_cv_sleep(&t->cv, &t->lk, INFINITE);   /* (the rumble thread can wait before the start, a pad connected at boot) */
     int64_t due = t->due_ns;
     ReleaseSRWLockExclusive(&t->lk);
-    /* (chrispository, PR 55: a first wait before the start blocks until it, as on Horizon) */
     hos_sleep_ns(due - hos_now_ns());
     AcquireSRWLockExclusive(&t->lk);
     if (t->period_ns > 0) {
@@ -1077,6 +1077,7 @@ HLE(_ZN2nn2os22StartOneShotTimerEventEPNS0_14TimerEventTypeENS_8TimeSpanE) {
     t->due_ns = hos_now_ns() + (int64_t)ARG(1);
     t->period_ns = 0;
     t->signaled = 0;
+    WakeAllConditionVariable(&t->cv);   /* (a WaitTimerEvent that came first) */
     ReleaseSRWLockExclusive(&t->lk);
     WakeAllConditionVariable(&t->cv);
     poke_multiwait();

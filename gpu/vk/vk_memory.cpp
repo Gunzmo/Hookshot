@@ -8,6 +8,7 @@
 // numbers each) and is refreshed when its generation changes, at a submit.
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <chrono>
 #include <map>
 #include <memory>
@@ -728,6 +729,9 @@ void memory_drop_shadow(uint64_t guest, uint64_t size) {
 /// -fasync-exceptions clang catches a fault in a __try block only across a call, and a 4 KB memcpy inlined into the
 /// block (the per-page retry) faulted past the handler: the crash that kept the texture storage out of the capture.
 void* (*volatile guarded_memcpy)(void*, const void*, size_t) = std::memcpy;
+#ifndef _WIN32   // (hookshot) Linux: a fault is a signal (host/linux/win32.c)
+bool guarded_copy(void* dst, const void* src, size_t n) { return win32_guarded_copy(dst, src, n) != 0; }
+#else
 __declspec(noinline) bool guarded_copy(void* dst, const void* src, size_t n) {
     __try {
         guarded_memcpy(dst, src, n);
@@ -736,6 +740,7 @@ __declspec(noinline) bool guarded_copy(void* dst, const void* src, size_t n) {
     }
     return true;
 }
+#endif
 // ---- a capture's copies: on the submitting thread and two helpers (RX_VK_CAPTURE_THREADS=<n>, 0-4): ~9 MB of the
 // game's dynamic data a submit, four submits a frame, ~1.4 ms on the game's thread each with one ----
 // (a page written and then unmapped before the submit faulted a plain copy: ReadProcessMemory fails on it instead.
